@@ -580,7 +580,6 @@ mod tests {
         let row = StoredTransfer {
             block_number: 9,
             tx_index: 0,
-            log_index: 1,
             token: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             from: "0x1111111111111111111111111111111111111111".into(),
             to: "0x2222222222222222222222222222222222222222".into(),

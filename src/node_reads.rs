@@ -187,7 +187,9 @@ impl NodeReader {
             // receipts + base fee once per distinct block
             let mut blocks: BTreeMap<u64, (Vec<Receipt>, Option<u64>)> = BTreeMap::new();
             for entry in &entries {
-                if !blocks.contains_key(&entry.block_number) {
+                if let std::collections::btree_map::Entry::Vacant(vacant) =
+                    blocks.entry(entry.block_number)
+                {
                     let receipts = env
                         .receipts_by_block(entry.block_number.into())?
                         .ok_or_else(|| {
@@ -197,7 +199,7 @@ impl NodeReader {
                         .sealed_header_by_number(entry.block_number)?
                         .ok_or_else(|| eyre!("header missing for block {}", entry.block_number))?
                         .base_fee_per_gas();
-                    blocks.insert(entry.block_number, (receipts, base_fee));
+                    vacant.insert((receipts, base_fee));
                 }
             }
 
@@ -593,22 +595,6 @@ fn own_gas_used(receipts: &[Receipt], index: usize) -> u64 {
     }
 }
 
-/// Per-transaction gas from a block's cumulative receipt values (pure; the
-/// T6 vector target: `[21000, 74000, 74100]` ⇒ `[21000, 53000, 100]`).
-pub fn gas_used_from_cumulative(cumulative: &[u64]) -> Vec<u64> {
-    cumulative
-        .iter()
-        .enumerate()
-        .map(|(i, cum)| {
-            if i == 0 {
-                *cum
-            } else {
-                cum.saturating_sub(cumulative[i - 1])
-            }
-        })
-        .collect()
-}
-
 /// The distinct block numbers referenced by a pointer list, first-seen order
 /// preserved (pure; drives the one-replay-per-block hydration grouping).
 pub fn distinct_blocks(pointers: &[TxPointer]) -> Vec<u64> {
@@ -649,6 +635,21 @@ pub fn desc_page_items(total: u64, page: u64, per_page: u64) -> Vec<u64> {
 mod tests {
     use super::*;
 
+    /// The whole-block gas vector derived through [`own_gas_used`].
+    fn gas_used_from_cumulative(cumulative: &[u64]) -> Vec<u64> {
+        let receipts: Vec<Receipt> = cumulative
+            .iter()
+            .map(|&cumulative_gas_used| Receipt {
+                success: true,
+                cumulative_gas_used,
+                ..Default::default()
+            })
+            .collect();
+        (0..receipts.len())
+            .map(|index| own_gas_used(&receipts, index))
+            .collect()
+    }
+
     #[test]
     fn gas_cumulative_diff_vectors() {
         assert_eq!(
@@ -657,18 +658,6 @@ mod tests {
         );
         assert_eq!(gas_used_from_cumulative(&[]), Vec::<u64>::new());
         assert_eq!(gas_used_from_cumulative(&[42_000]), vec![42_000]);
-        // own_gas_used mirrors the same math per index
-        let receipts: Vec<Receipt> = [21_000u64, 74_000, 74_100]
-            .into_iter()
-            .map(|cumulative_gas_used| Receipt {
-                success: true,
-                cumulative_gas_used,
-                ..Default::default()
-            })
-            .collect();
-        assert_eq!(own_gas_used(&receipts, 0), 21_000);
-        assert_eq!(own_gas_used(&receipts, 1), 53_000);
-        assert_eq!(own_gas_used(&receipts, 2), 100);
     }
 
     #[test]

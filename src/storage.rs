@@ -135,8 +135,6 @@ pub struct StoredTransfer {
     pub block_number: u64,
     /// Zero-based index of the transaction within its block.
     pub tx_index: u64,
-    /// Index of the log within its transaction's receipt logs.
-    pub log_index: u64,
     /// Emitting token contract (lowercase hex).
     pub token: String,
     /// Sender (lowercase hex).
@@ -464,6 +462,9 @@ pub fn address_txs_page(
     rows.collect()
 }
 
+/// Column list shared by the transfer page queries. `log_index` is selected
+/// only so the post-UNION `ORDER BY` can reference it; the wire rows carry no
+/// log index (the explorer's `TokenTransfer` has none).
 const TRANSFER_COLUMNS: &str =
     "block_number, tx_index, log_index, token, from_addr, to_addr, value";
 
@@ -471,7 +472,7 @@ fn transfer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTransfer
     Ok(StoredTransfer {
         block_number: row.get(0)?,
         tx_index: row.get(1)?,
-        log_index: row.get(2)?,
+        // column 2 (log_index) drives ordering only
         token: row.get(3)?,
         from: row.get(4)?,
         to: row.get(5)?,
@@ -667,6 +668,68 @@ mod tests {
             .expect("count");
         let cursor = read_cursor(&conn).expect("cursor");
         (address_rows, transfers, cursor)
+    }
+
+    fn block_with_transfers(
+        number: u64,
+        transfers: &[(Address, Address, Address, u64)],
+    ) -> ExtractedBlock {
+        ExtractedBlock {
+            number,
+            address_rows: vec![],
+            transfers: transfers
+                .iter()
+                .enumerate()
+                .map(|(log_index, (token, from, to, value))| TransferRow {
+                    block_number: number,
+                    tx_index: 0,
+                    log_index: log_index as u64,
+                    token: *token,
+                    from: *from,
+                    to: *to,
+                    value: U256::from(*value),
+                })
+                .collect(),
+            token_candidates: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_pages_union_and_order_newest_first() {
+        let (_dir, path) = temp_db();
+        let writer = Writer::open(path, 0x1e7).await.expect("open");
+        let token = addr(0xa1);
+        let (me, other) = (addr(0x0b), addr(0x0c));
+        // block 1: me -> other, then a self-transfer (dedup: counted once)
+        writer
+            .index_block(
+                block_with_transfers(1, &[(token, me, other, 10), (token, me, me, 5)]),
+                vec![],
+            )
+            .await
+            .expect("index 1");
+        // block 2: other -> me (recipient arm of the union)
+        writer
+            .index_block(block_with_transfers(2, &[(token, other, me, 7)]), vec![])
+            .await
+            .expect("index 2");
+
+        let conn = writer.conn.lock().expect("lock");
+        let key = addr_hex(&me);
+        assert_eq!(count_address_transfers(&conn, &key).expect("count"), 3);
+        let page = address_transfers_page(&conn, &key, 25, 0).expect("page");
+        // newest first across both union arms
+        assert_eq!(
+            page.iter()
+                .map(|t| (t.block_number, t.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "7"), (1, "5"), (1, "10")]
+        );
+        // token feed sees every transfer
+        let token_key = addr_hex(&token);
+        assert_eq!(count_token_transfers(&conn, &token_key).expect("count"), 3);
+        let token_page = token_transfers_page(&conn, &token_key, 2, 1).expect("page");
+        assert_eq!(token_page.len(), 2); // offset pagination applies
     }
 
     #[tokio::test]
