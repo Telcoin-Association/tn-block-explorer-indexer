@@ -8,9 +8,12 @@ use clap::Parser;
 use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env};
 use tn_node::launch_node;
 
+mod api;
 mod extract;
 mod node_reads;
+mod status;
 mod storage;
+mod types;
 
 fn main() {
     // Must be the first statement of main: reads and clears TN_BLS_PASSPHRASE
