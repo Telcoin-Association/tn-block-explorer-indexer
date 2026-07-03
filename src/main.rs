@@ -9,6 +9,7 @@ use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env};
 use tn_node::launch_node;
 
 mod extract;
+mod node_reads;
 mod storage;
 
 fn main() {
