@@ -1,0 +1,6 @@
+/target
+*.log
+/local-validators
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

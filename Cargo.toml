@@ -1,0 +1,87 @@
+[package]
+name = "telcoin-explorer-indexer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+description = "Block-explorer indexer ExEx host: an observer Telcoin Network node serving explorer queries from the node's own databases plus a small derived SQLite index"
+license = "MIT OR Apache-2.0"
+
+[workspace] # single-member workspace root — stops cargo walking up to a parent workspace
+
+[workspace.dependencies]
+# ALL tn deps MUST pin the exact same rev; bump all in ONE commit. Mixed revs give
+# cargo two checkouts of the same crates => duplicate-type errors everywhere.
+# <TN_REV> = the exex-startup branch head (BLS passphrase API + RethEnv read API).
+# ExEx (da90408a) is in NO tag yet; switch rev -> tag when a tag containing all of it exists.
+telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }
+tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }
+tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }
+tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }
+tn-reth = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }     # RethEnv is named in ExEx signatures; NOT re-exported by tn-exex
+tn-storage = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }  # ConsensusChain lives here (named in node_reads/axum state)
+tn-engine = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" }   # only to forward adiri
+tn-executor = { git = "https://github.com/Telcoin-Association/telcoin-network", rev = "28035074198359b53aca04a355a3b8f89ab66ec1" } # only to forward adiri
+
+[dependencies]
+telcoin-network-cli = { workspace = true }
+tn-node = { workspace = true }
+tn-exex = { workspace = true }
+tn-types = { workspace = true }
+tn-reth = { workspace = true }
+tn-storage = { workspace = true }
+tn-engine = { workspace = true, optional = true }
+tn-executor = { workspace = true, optional = true }
+
+# Majors MUST match tn-3's workspace — these types cross the git-dep API boundary
+# (tn-3 root Cargo.toml: clap 4, eyre 0.6, futures 0.3, tokio 1.44, tracing 0.1):
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "net"] } # net: axum serve
+futures = "0.3"
+tracing = "0.1"
+
+# Indexer-only deps (invisible to tn-3; free choice of version):
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+rusqlite = { version = "0.37", features = ["bundled"] } # `bundled` is REQUIRED (vendors SQLite); 0.38+ needs cfg_select (unstable on 1.94)
+tokio-util = "0.7"                                      # CancellationToken
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# NO standalone hex crate: tn_types re-exports `hex` (alloy const-hex), `hex_literal`, keccak256.
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Testnet chain-id-2017 builds ONLY; NOT for local dev (chain 0x1e7) or mainnet.
+# The adiri feature does NOT cascade in tn-3 — every declaring crate must be
+# enabled explicitly. Re-verify this set on every rev bump (see the ops runbook).
+adiri = [
+  "telcoin-network-cli/adiri",
+  "tn-types/adiri",
+  "tn-reth/adiri",
+  "tn-storage/adiri",
+  "dep:tn-engine",
+  "tn-engine/adiri",
+  "dep:tn-executor",
+  "tn-executor/adiri",
+]
+
+[profile.release]
+panic = "unwind" # NEVER "abort": ExEx isolation (catch_unwind) and node task
+                 # supervision rely on unwinding. abort => any ExEx panic kills the node.
+
+# Local development against a checkout of ../tn-3 — uncomment ALL entries or NONE
+# (a partial patch splits the graph into two source trees => duplicate-crate type
+# errors). NEVER commit with the patch active.
+# [patch."https://github.com/Telcoin-Association/telcoin-network"]
+# telcoin-network-cli = { path = "../tn-3/crates/telcoin-network-cli" }
+# tn-node = { path = "../tn-3/crates/node" }
+# tn-exex = { path = "../tn-3/crates/exex" }
+# tn-types = { path = "../tn-3/crates/types" }
+# tn-reth = { path = "../tn-3/crates/tn-reth" }
+# tn-storage = { path = "../tn-3/crates/storage" }
+# tn-engine = { path = "../tn-3/crates/engine" }
+# tn-executor = { path = "../tn-3/crates/consensus/executor" }
