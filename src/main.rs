@@ -8,6 +8,9 @@ use clap::Parser;
 use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env};
 use tn_node::launch_node;
 
+mod extract;
+mod storage;
+
 fn main() {
     // Must be the first statement of main: reads and clears TN_BLS_PASSPHRASE
     // before any threads exist (see `get_bls_passphrase_from_env`).
@@ -19,10 +22,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    if let Err(err) = cli.run(passphrase, |mut builder, _, tn_datadir, key_config, version| {
-        builder.install_exex("explorer-indexer", |_ctx| async move { Ok(()) });
-        launch_node(builder, tn_datadir, key_config, version)
-    }) {
+    if let Err(err) = cli.run(
+        passphrase,
+        |mut builder, _, tn_datadir, key_config, version| {
+            builder.install_exex("explorer-indexer", |_ctx| async move { Ok(()) });
+            launch_node(builder, tn_datadir, key_config, version)
+        },
+    ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
