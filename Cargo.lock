@@ -11626,7 +11626,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "telcoin-explorer-indexer"
+name = "tn-block-explorer-indexer"
 version = "0.1.0"
 dependencies = [
  "axum",

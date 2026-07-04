@@ -1,4 +1,4 @@
-# telcoin-explorer-indexer
+# tn-block-explorer-indexer
 
 A block-explorer indexer for Telcoin Network, built on tn-3's ExEx plugin system.
 The binary is a full observer node that runs an indexing ExEx and serves a small HTTP API from the same process.
@@ -35,7 +35,7 @@ Kill the stock observer it started, then run this binary as the observer against
 Note there is no `--http`: the indexer API replaces node RPC for the explorer.
 
 ```sh
-TN_BLS_PASSPHRASE=local target/release/telcoin-explorer-indexer node \
+TN_BLS_PASSPHRASE=local target/release/tn-block-explorer-indexer node \
     --datadir ../tn-3/local-validators/observer \
     --observer --instance 5 \
     --indexer.api-addr 127.0.0.1:8560 \
