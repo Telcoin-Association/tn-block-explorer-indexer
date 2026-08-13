@@ -209,9 +209,11 @@ pub struct ApiEpoch {
     pub certified: bool,
     /// Whether this is the in-progress epoch (synthesized; no record yet).
     pub is_current: bool,
-    /// Committee ADDRESSES, best-effort: only while the epoch is inside the
-    /// on-chain registry's ring buffer (`null` otherwise — BLS keys above are
-    /// the always-available identity). Populated on the detail route only.
+    /// Committee ADDRESSES, read from the registry pinned to the block that
+    /// seated this epoch's committee — available for any past epoch, not just
+    /// recent ones. `null` when the pin cannot be resolved locally (missing
+    /// predecessor epoch record or missing pin block; BLS keys above are the
+    /// always-available identity). Populated on the detail route only.
     pub committee_addresses: Option<Vec<String>>,
 }
 

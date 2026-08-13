@@ -70,7 +70,7 @@ Missing resources are `404 {"error":"not found"}`.
 | `GET /address/{addr}/transfers` | ERC-20 transfers where the address is sender or recipient |
 | `GET /tokens/{addr}` | token name/symbol/decimals + live `totalSupply` |
 | `GET /tokens/{addr}/transfers` | the token's transfer feed |
-| `GET /epochs`, `GET /epochs/{n}` | epoch history from the consensus DB's epoch records |
+| `GET /epochs`, `GET /epochs/{n}` | epoch history from the consensus DB's epoch records; the detail route adds committee addresses from a registry read pinned to that epoch's seating block |
 | `GET /epochs/current` | the in-progress epoch from the on-chain registry |
 | `GET /validators` | the current committee's registry `ValidatorInfo`s |
 | `GET /validators/leaders?window=200` | blocks per leader over the trailing window (max 1000) |
