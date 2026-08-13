@@ -11,6 +11,12 @@
 //! `ConsensusChain`/`EpochRecordDb` reads are async message-passing to a
 //! background file-owner thread — they are awaited directly on the async
 //! runtime and need no permit.
+//!
+//! Per-epoch committee reads must name their pin: tn-reth has no unpinned
+//! per-epoch committee reader, because the registry mutates the CURRENT
+//! epoch's committee arrays mid-epoch on a governance `burn`. The pin comes
+//! from the consensus DB's epoch records (the previous epoch's closing block)
+//! and is resolved OUTSIDE the blocking closure — see [`NodeReader::committee_addresses`].
 
 use crate::{
     extract::{SEL_DECIMALS, SEL_NAME, SEL_SYMBOL, SEL_TOTAL_SUPPLY},
@@ -26,7 +32,7 @@ use tn_reth::{
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     Address, Block, BlockHeader as _, Bytes, Receipt, RecoveredBlock, SealedBlock, SolValue,
-    TransactionSigned, TxHash,
+    TransactionSigned, TxHash, B256,
 };
 use tokio::sync::{oneshot, Semaphore};
 
@@ -420,28 +426,78 @@ impl NodeReader {
         .await
     }
 
-    /// Committee `ValidatorInfo`s for an epoch from the on-chain registry
+    /// The CURRENT committee's registry `ValidatorInfo`s at the canonical tip
     /// (serves `/validators`).
-    pub async fn validators_for_epoch(
+    ///
+    /// A tip read, matching the removed `RethEnv::validators_for_epoch` (which
+    /// was also unpinned): it reflects a mid-epoch governance `burn`
+    /// immediately, which is the live state an explorer should show. The epoch
+    /// is the registry's own `getCurrentEpoch` at the tip, so no epoch argument
+    /// is needed — this also drops the old cross-source coupling where the
+    /// epoch came from the consensus DB but the committee came from the EVM,
+    /// which could disagree across a boundary.
+    pub async fn current_committee_validators(
         &self,
-        epoch: u32,
     ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
         self.read("indexer-validators", move |env| {
-            env.validators_for_epoch(epoch)
+            Ok(env.epoch_state_from_canonical_tip()?.validators)
         })
         .await
     }
 
-    /// Best-effort committee ADDRESSES for an epoch: `None` outside the
-    /// registry's ring buffer (where `getCommitteeValidators` reverts) or on
-    /// any read failure. BLS keys are always available from the epoch record
-    /// instead — documented limitation.
+    /// Committee ADDRESSES for `epoch`, pinned to the block that seated that
+    /// committee (serves `/epochs/{n}`).
+    ///
+    /// The pin is the previous epoch's closing block — `record(epoch - 1)
+    /// .final_state` from the consensus DB's epoch records — or genesis for
+    /// epoch 0. Pinning there means `getCommitteeValidators` runs at a state
+    /// where `epoch` IS the registry's current epoch, so the registry's
+    /// retained-epoch window (`[current - 3, current + 2]`) never applies and
+    /// every past epoch answers. This is the ONE place a consensus-DB read
+    /// feeds a `RethEnv` read.
+    ///
+    /// `None` when the predecessor record has not been written yet, when the
+    /// pin block is missing from the node DB, or on any read failure — the
+    /// route degrades to the epoch record's BLS keys rather than failing.
+    ///
+    /// For the IN-PROGRESS epoch this returns the committee as SEATED AT THE
+    /// BOUNDARY, while `/epochs/current` and `/validators` read the mutable
+    /// tip; the two disagree after a mid-epoch governance `burn`. That split is
+    /// intended: this route describes the epoch, those describe the registry
+    /// right now.
     pub async fn committee_addresses(&self, epoch: u32) -> Option<Vec<Address>> {
+        // genesis pin for epoch 0; otherwise the previous epoch's closing block
+        let pin: Option<B256> = match epoch.checked_sub(1) {
+            None => None,
+            Some(previous) => Some(
+                self.consensus()
+                    .epochs()
+                    .record_by_epoch(previous)
+                    .await?
+                    .final_state
+                    .hash,
+            ),
+        };
         self.read("indexer-epoch-committee", move |env| {
-            Ok(env
-                .validators_for_epoch(epoch)
-                .ok()
-                .map(|infos| infos.iter().map(|info| info.validatorAddress).collect()))
+            let Some(header) = (match pin {
+                Some(hash) => env.sealed_header_by_hash(hash)?,
+                None => env.sealed_header_by_number(0)?,
+            }) else {
+                return Ok(None);
+            };
+            let state = env.epoch_state_at_header(&header)?;
+            // tripwire: the pin must report the epoch we asked for. Serving a
+            // neighbouring epoch's committee silently is worse than `null`.
+            if state.epoch != epoch {
+                return Ok(None);
+            }
+            Ok(Some(
+                state
+                    .validators
+                    .iter()
+                    .map(|info| info.validatorAddress)
+                    .collect(),
+            ))
         })
         .await
         .ok()

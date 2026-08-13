@@ -636,9 +636,10 @@ async fn epoch_current(State(state): State<Arc<ApiState>>) -> ApiResult<ApiEpoch
     }))
 }
 
-/// `GET /epochs/{n}` — an epoch record + certificate presence, with
-/// best-effort committee ADDRESSES while `n` is inside the registry's ring
-/// buffer (BLS keys are always available).
+/// `GET /epochs/{n}` — an epoch record + certificate presence, with committee
+/// ADDRESSES read from the registry pinned to the block that seated `n`'s
+/// committee. `null` only when the predecessor epoch record or the pin block
+/// itself is missing locally (BLS keys are always available).
 async fn epoch_by_number(
     State(state): State<Arc<ApiState>>,
     Path(raw): Path<String>,
@@ -665,8 +666,7 @@ async fn epoch_by_number(
 
 /// `GET /validators` — the current committee's registry `ValidatorInfo`s.
 async fn validators(State(state): State<Arc<ApiState>>) -> ApiResult<Vec<ApiValidator>> {
-    let epoch = state.reader.consensus().latest_consensus_epoch();
-    let infos = state.reader.validators_for_epoch(epoch).await?;
+    let infos = state.reader.current_committee_validators().await?;
     Ok(Json(infos.iter().map(api_validator).collect()))
 }
 
