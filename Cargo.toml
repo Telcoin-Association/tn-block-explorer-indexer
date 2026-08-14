@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 # cargo two checkouts of the same crates => duplicate-type errors everywhere.
 # <TN_REV> = the exex-startup branch head (BLS passphrase API + RethEnv read API).
 # ExEx (da90408a) is in NO tag yet; switch rev -> tag when a tag containing all of it exists.
-telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }
+telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
 tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
 tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
 tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
