@@ -15,13 +15,13 @@ license = "MIT OR Apache-2.0"
 # <TN_REV> = the exex-startup branch head (BLS passphrase API + RethEnv read API).
 # ExEx (da90408a) is in NO tag yet; switch rev -> tag when a tag containing all of it exists.
 telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }
-tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }
-tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }
-tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }
-tn-reth = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }     # RethEnv is named in ExEx signatures; NOT re-exported by tn-exex
-tn-storage = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }  # ConsensusChain lives here (named in node_reads/axum state)
-tn-engine = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" }   # only to forward adiri
-tn-executor = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.0-adiri" } # only to forward adiri
+tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
+tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
+tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }
+tn-reth = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }     # RethEnv is named in ExEx signatures; NOT re-exported by tn-exex
+tn-storage = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }  # ConsensusChain lives here (named in node_reads/axum state)
+tn-engine = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" }   # only to forward adiri
+tn-executor = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.13.2-adiri" } # only to forward adiri
 
 [dependencies]
 telcoin-network-cli = { workspace = true }
