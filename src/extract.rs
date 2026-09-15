@@ -137,8 +137,9 @@ pub struct ConsensusRow {
 /// Written by the header assembly in `tn-reth/src/evm/block.rs` (~:1493-1525)
 /// from `TNPayload::new` (`tn-reth/src/payload.rs`, ~:102-138) and
 /// `context_for_next_block` (`tn-reth/src/evm/config.rs`, ~:231-235):
-/// - `parent_beacon_block_root` = `ConsensusHeader::digest()`; `Some` for every
-///   post-genesis block, `None` for genesis → [`digest`](Self::digest)
+/// - `parent_beacon_block_root` = `ConsensusHeader::digest()` for every
+///   post-genesis block (genesis carries `Some(B256::ZERO)`, a reth Cancun
+///   genesis artefact, and is excluded by number) → [`digest`](Self::digest)
 /// - `nonce` = sub-dag leader's `(epoch << 32) | round`
 ///   (`tn-types/src/primary/header.rs:213`) → [`epoch`](Self::epoch), [`round`](Self::round)
 /// - `difficulty` = `(batch_index << 16) | worker_id` → [`batch_index`](Self::batch_index),
@@ -172,13 +173,19 @@ pub struct HeaderConsensusFields {
 
 /// Decode [`HeaderConsensusFields`] from an executed block header.
 ///
-/// `None` for genesis (no `parent_beacon_block_root`) and for a `difficulty`
-/// that does not fit `u64`: TN always packs a `usize`
+/// `None` for genesis and for a `difficulty` that does not fit `u64`. Genesis
+/// is block 0: reth writes a Cancun-style genesis header whose
+/// `parent_beacon_block_root` is `Some(B256::ZERO)`, not `None`, so the number
+/// is the only reliable marker (a missing root is also treated as genesis for
+/// pre-Cancun chain specs). TN always packs a `usize` into `difficulty`
 /// (`tn-reth/src/evm/config.rs:235`), so overflow means this is not a TN block
 /// and none of its fields should be trusted. The nonce bytes are big-endian,
 /// matching alloy's `B64: From<u64>` used on the write side (`ctx.nonce.into()`),
 /// and `deconstruct_nonce` (`tn-types/src/helpers.rs:284`) returns `(epoch, round)`.
 pub fn decode_consensus_fields(header: &ExecHeader) -> Option<HeaderConsensusFields> {
+    if header.number == 0 {
+        return None;
+    }
     let digest = header.parent_beacon_block_root?;
     let (epoch, round) = deconstruct_nonce(u64::from_be_bytes(header.nonce.0));
     let difficulty = u64::try_from(header.difficulty).ok()?;
@@ -755,6 +762,14 @@ mod tests {
         // genesis has no parent_beacon_block_root: no consensus output produced it
         let genesis = make_block(0, vec![], vec![]);
         assert_eq!(extract_block(&genesis, &[]).consensus, None);
+
+        // the real reth genesis header carries Some(B256::ZERO) (Cancun genesis
+        // artefact) with zeroed nonce/difficulty — still no consensus output
+        let mut real_genesis = consensus_header(0);
+        real_genesis.parent_beacon_block_root = Some(B256::ZERO);
+        assert_eq!(decode_consensus_fields(&real_genesis), None);
+        let block = make_block_with_header(real_genesis, vec![], vec![]);
+        assert_eq!(extract_block(&block, &[]).consensus, None);
     }
 
     #[test]
