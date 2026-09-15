@@ -595,31 +595,16 @@ impl NodeReader {
         self.consensus.latest_consensus_epoch()
     }
 
-    /// One consensus header by number (serves `/consensus/blocks/{n}`): one
-    /// actor round-trip decoding the header WITH its embedded sub-DAG (KBs).
+    /// One FULL consensus output by number — header plus every batch's raw
+    /// transactions (serves `/consensus/blocks/{n}` detail and `/batches`).
+    /// One actor round-trip decoding roughly a `/blocks` page of tx bytes;
+    /// never call it from a list.
     ///
     /// `Ok(None)` outside `1..=latest_consensus_number()` with no pack touch
     /// (see [`consensus_number_stored`]) and for a sealed epoch whose pack this
     /// observer does not hold. `Err` for a pack that exists but cannot be read
     /// — except at exactly the tip, where the transient race is tolerated as
     /// `Ok(None)` (see [`tolerate_tip_race`]).
-    pub async fn consensus_header(&self, number: u64) -> eyre::Result<Option<ConsensusHeader>> {
-        let latest = self.latest_consensus_number();
-        if !consensus_number_stored(number, latest) {
-            return Ok(None);
-        }
-        tolerate_tip_race(
-            self.consensus.consensus_header_by_number(number).await,
-            number,
-            latest,
-        )
-    }
-
-    /// One FULL consensus output by number — header plus every batch's raw
-    /// transactions (serves `/consensus/blocks/{n}` detail and `/batches`).
-    /// One actor round-trip decoding roughly a `/blocks` page of tx bytes;
-    /// never call it from a list. Bounds and error handling exactly as
-    /// [`Self::consensus_header`].
     pub async fn consensus_output(&self, number: u64) -> eyre::Result<Option<ConsensusOutput>> {
         let latest = self.latest_consensus_number();
         if !consensus_number_stored(number, latest) {
