@@ -583,6 +583,9 @@ async fn epoch_row(db: &EpochRecordDb, epoch: u64, current: u64) -> ApiEpoch {
         certified: certificate.is_some(),
         is_current,
         committee_addresses: None,
+        // populated by the consensus-routes handler work (Wave 2)
+        record: None,
+        certificate: None,
     }
 }
 
