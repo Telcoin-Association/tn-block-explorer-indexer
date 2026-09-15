@@ -644,15 +644,15 @@ pub fn tx_type_page(
     rows.collect()
 }
 
-/// The execution block range recorded for one consensus output digest
-/// (`digest` as produced by [`digest_hex`]), or `None` when no block naming
-/// that digest has been indexed yet.
+/// The execution block range recorded for one consensus output digest (the
+/// row key is [`digest_hex`] of it), or `None` when no block naming that
+/// digest has been indexed yet.
 pub fn consensus_range_by_digest(
     conn: &Connection,
-    digest: &str,
+    digest: &B256,
 ) -> rusqlite::Result<Option<ConsensusRange>> {
     conn.prepare_cached("SELECT first_block, last_block FROM consensus_blocks WHERE digest = ?1")?
-        .query_row([digest], |row| {
+        .query_row([digest_hex(digest)], |row| {
             Ok(ConsensusRange {
                 first_block: row.get(0)?,
                 last_block: row.get(1)?,
@@ -663,18 +663,18 @@ pub fn consensus_range_by_digest(
 
 /// [`consensus_range_by_digest`] for a whole list page (≤ `MAX_PER_PAGE`
 /// digests): one cached point lookup per digest, keyed back by the input
-/// string. Digests without a row are simply absent from the map — the caller
+/// digest. Digests without a row are simply absent from the map — the caller
 /// renders them as `exec_blocks: null`.
 pub fn consensus_ranges_by_digests(
     conn: &Connection,
-    digests: &[String],
-) -> rusqlite::Result<BTreeMap<String, ConsensusRange>> {
+    digests: &[B256],
+) -> rusqlite::Result<BTreeMap<B256, ConsensusRange>> {
     let mut stmt = conn
         .prepare_cached("SELECT first_block, last_block FROM consensus_blocks WHERE digest = ?1")?;
     let mut out = BTreeMap::new();
     for digest in digests {
         let range = stmt
-            .query_row([digest], |row| {
+            .query_row([digest_hex(digest)], |row| {
                 Ok(ConsensusRange {
                     first_block: row.get(0)?,
                     last_block: row.get(1)?,
@@ -682,7 +682,7 @@ pub fn consensus_ranges_by_digests(
             })
             .optional()?;
         if let Some(range) = range {
-            out.insert(digest.clone(), range);
+            out.insert(*digest, range);
         }
     }
     Ok(out)
@@ -1167,25 +1167,25 @@ mod tests {
         assert_eq!(snapshot(&writer).consensus_blocks, 2);
 
         let conn = writer.conn.lock().expect("lock");
-        let (key_a, key_b) = (digest_hex(&output_a), digest_hex(&output_b));
+        let key_a = digest_hex(&output_a);
         // 0x + 64 lowercase hex chars
         assert_eq!(key_a, format!("0x{}", "d1".repeat(32)));
         assert_eq!(
-            consensus_range_by_digest(&conn, &key_a).expect("read"),
+            consensus_range_by_digest(&conn, &output_a).expect("read"),
             Some(ConsensusRange {
                 first_block: 10,
                 last_block: 12
             })
         );
         assert_eq!(
-            consensus_range_by_digest(&conn, &key_b).expect("read"),
+            consensus_range_by_digest(&conn, &output_b).expect("read"),
             Some(ConsensusRange {
                 first_block: 13,
                 last_block: 13
             })
         );
         assert_eq!(
-            consensus_range_by_digest(&conn, &digest_hex(&digest(0xd3))).expect("read"),
+            consensus_range_by_digest(&conn, &digest(0xd3)).expect("read"),
             None
         );
         // epoch/round persist alongside the range
@@ -1198,15 +1198,12 @@ mod tests {
             .expect("row");
         assert_eq!((epoch, round), (3, 41));
 
-        // batch lookup keeps only the digests that have rows
-        let ranges = consensus_ranges_by_digests(
-            &conn,
-            &[key_a.clone(), digest_hex(&digest(0xd3)), key_b.clone()],
-        )
-        .expect("batch");
+        // batch lookup keeps only the digests that have rows, keyed by digest
+        let ranges =
+            consensus_ranges_by_digests(&conn, &[output_a, digest(0xd3), output_b]).expect("batch");
         assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[&key_a].last_block, 12);
-        assert_eq!(ranges[&key_b].first_block, 13);
+        assert_eq!(ranges[&output_a].last_block, 12);
+        assert_eq!(ranges[&output_b].first_block, 13);
     }
 
     #[tokio::test]
@@ -1569,7 +1566,7 @@ mod tests {
         // in-place updates roll back too: the range did not widen and the new
         // type's counter was never created
         assert_eq!(
-            consensus_range_by_digest(&conn, &digest_hex(&output)).expect("read"),
+            consensus_range_by_digest(&conn, &output).expect("read"),
             Some(ConsensusRange {
                 first_block: 1,
                 last_block: 1

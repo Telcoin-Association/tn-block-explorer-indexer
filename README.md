@@ -57,7 +57,7 @@ Testnet (adiri, chain id 2017) builds need the feature: `cargo build --release -
 
 ## Endpoints
 
-All list endpoints return `{items, total, page, per_page}` with 0-based `page`, `per_page` default 25 (max 100), newest first.
+All list endpoints return `{items, total, page, per_page}` with 0-based `page`, `per_page` default 25 (max 100), newest first, with one exception: `/txs/{hash}/transfers` is in ascending `log_index` order.
 Missing resources are `404 {"error":"not found"}`; malformed query parameters are 400.
 
 | Route | Returns |
@@ -100,10 +100,10 @@ The index is generic, so nothing here changes if the allowlist widens.
 
 Every change to an existing response is a new field; existing clients are unaffected.
 
-- `ApiBlock.consensus` on `/blocks` and `/blocks/{number}`: decoded purely from the execution header, no consensus DB read. Carries `digest` (with `digest_bs58`), `epoch`, `round`, `batch_index`, `worker_id`, `batch_digest`, `prev_randao`, `closes_epoch`. `consensus_number` is resolved on `/blocks/{number}` only and is `null` on lists. The whole object is `null` for genesis.
+- `ApiBlock.consensus` on `/blocks` and `/blocks/{number}`: decoded from the execution header; `/blocks/{n}` adds one consensus-pack read for `consensus_number`, null if that epoch's pack is not held. Carries `digest` (with `digest_bs58`), `epoch`, `round`, `batch_index`, `worker_id`, `batch_digest`, `prev_randao`, `closes_epoch`. `consensus_number` is `null` on lists. The whole object is `null` for genesis. The single empty block of an empty epoch-closing output carries placeholder values: `batch_index` 0, `worker_id` 0 and an all-zero `batch_digest`.
 - `ApiEpoch.record` and `ApiEpoch.certificate` on `/epochs` and `/epochs/{n}`: the stored epoch record and its certificate. `record` is `null` for the current epoch, `certificate` is `null` while uncertified, and `certificate.verified` (a BLS pairing check) is populated on `/epochs/{n}` only.
 - `ApiTransaction.tx_type` (the EIP-2718 type byte) and `tx_type_name` on every transaction row.
-- `/txs/{hash}` only: `token_transfers`, the first page (up to 100) of the transaction's ERC-20 transfers in `log_index` order, and `token_transfer_count`, the full count. Both are absent from list rows; `/txs/{hash}/transfers` pages through the rest.
+- `/txs/{hash}` only: `token_transfers`, the first page (up to 100) of the transaction's ERC-20 transfers in `log_index` order, and `token_transfer_count`, the full count. Both are absent from list rows; `/txs/{hash}/transfers` pages through the rest. Both are also absent for a transaction the index has not reached yet (`/health.lag > 0`), so "not indexed yet" and "no transfers" stay distinguishable; `/txs/{hash}/transfers` returns an empty page in that state.
 - `ApiTokenTransfer.log_index`: the position of the `Transfer` log within its transaction's receipt.
 
 ### Internal transactions
@@ -117,9 +117,13 @@ There are no EVM call traces: that would require tn-reth to export its EVM confi
 
 Consensus block numbers start at 1; 0 is the pre-genesis anchor and returns 404, as does any number above the latest consensus number or any epoch above the current one.
 `exec_blocks` on a consensus header is `null` when the indexer has not reached those blocks yet and also when the output produced no execution blocks (an empty output that did not close an epoch); compare against `last_indexed` from `/health` to tell the two apart.
+A batch's `exec_block_number` follows the same rule and is `null` for batches past the end of the indexed range, which happens mid-output because the indexer commits one block per SQLite transaction.
 `closes_epoch` on a consensus block is `null` until the epoch record exists.
+On `/consensus/epochs` rows the current epoch has no `record`, `certificate`, `end_time` or range `last`, even if the node has already written its record; `consensus_range.first` and `exec_range.first` are `null` only when the previous epoch's record could not be read, which does not happen on a healthy node (the epoch record store is dense).
 List routes leave `verified`, `committee_addresses`, `pack_complete`, `last_committed_rounds`, and `final_reputation_scores` as `null`; each costs extra reads or a BLS verification, so only the detail routes populate them.
-An observer that does not hold an older epoch's consensus pack returns `null` for the pack-backed fields and 404 for the missing block, never a 500.
+An observer that does not hold an older epoch's consensus pack returns 404 for its blocks and `null` for `last_committed_rounds` and `final_reputation_scores`, never a 500; `pack_complete` is `false` when the pack is absent or incomplete, and `null` only for the current epoch and on list routes.
+The by-number routes cannot tell an absent pack from one that cannot be read (truncated or corrupt): the node answers both the same way, so both are 404 / `null`.
+When that looks wrong for an epoch the observer should hold, check the node log and `/blocks/{n}.consensus.consensus_number` for a block of that epoch; it resolves the pack by digest, which surfaces the real error as a `warn!` in the indexer log.
 
 Encoding: all 32-byte digests are `0x` hex.
 Consensus-header and epoch digests also carry a `*_bs58` companion, the full base58 form; its first 16 characters match what the node prints in its logs.
@@ -139,7 +143,7 @@ Writes are one SQLite transaction per block (pointer rows, type rows and counter
 Schema v3 adds `tx_types`, `tx_type_counts`, `consensus_blocks`, and the `address_txs.tx_type` column.
 The first start on v3 drops the v2 tables and replays from block 0 (about 4.3M blocks on testnet).
 The API keeps serving during the replay.
-Node-backed routes are complete immediately; everything SQLite-backed is partial until `/health` reports `lag == 0`: `?type=`, `/txs/{hash}/transfers` and `token_transfers`, `exec_blocks` and `consensus_number`, and the existing address and transfer feeds.
+Node-backed routes are complete immediately; everything SQLite-backed is partial until `/health` reports `lag == 0`: `?type=`, `/txs/{hash}/transfers` and `token_transfers`, `exec_blocks` (the only SQLite-backed consensus field; `consensus_number` is resolved through the consensus pack by digest, never SQLite), and the existing address and transfer feeds.
 Deploy in a low-traffic window.
 
 ## Bumping the tn-3 dependency

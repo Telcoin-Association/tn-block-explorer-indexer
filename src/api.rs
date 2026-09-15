@@ -16,9 +16,15 @@
 //! checked against the in-memory tip BEFORE any pack is touched, and an epoch
 //! pack this observer does not hold is a normal state, not a fault: the
 //! resource is 404 and per-epoch fields are `null` (with a `warn!` from
-//! `node_reads`), never 500. Only a pack that exists and cannot be read is an
-//! internal error. Execution routes never depend on the consensus DB:
-//! `/blocks/{n}` logs and drops `consensus_number` if that lookup fails.
+//! `node_reads`), never 500. The by-number routes cannot distinguish an
+//! absent pack from one that cannot be opened (truncated, corrupt): TN
+//! answers both `Ok(None)`, so both are 404 / `null`. An operator seeing that
+//! on a sealed epoch should check the node log and
+//! `/blocks/{n}.consensus.consensus_number` for a block of that epoch, which
+//! resolves the pack by digest and surfaces the real error as a `warn!`. A
+//! current-epoch read failure is an internal error (500). Execution routes
+//! never depend on the consensus DB: `/blocks/{n}` logs and drops
+//! `consensus_number` if that lookup fails.
 
 use crate::{
     extract::{decode_consensus_fields, parse_tx_type},
@@ -54,7 +60,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_reth::system_calls::ConsensusRegistry;
-use tn_types::{hex, Address, EpochCertificate, EpochRecord, TxHash};
+use tn_types::{hex, Address, EpochCertificate, EpochRecord, TxHash, B256};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -388,7 +394,9 @@ async fn txs_list(
 /// `GET /txs/{hash}` — mined transactions only (full input hex), carrying
 /// the first [`MAX_PER_PAGE`] ERC-20 transfers the transaction emitted and
 /// their total from one SQLite read (the paginated feed is
-/// `/txs/{hash}/transfers`).
+/// `/txs/{hash}/transfers`). Both fields are ABSENT while the index has not
+/// reached the transaction's block (`/health.lag > 0`), so "not indexed yet"
+/// is distinguishable from "no transfers".
 async fn tx_by_hash(
     State(state): State<Arc<ApiState>>,
     Path(raw): Path<String>,
@@ -397,10 +405,12 @@ async fn tx_by_hash(
     let Some(data) = state.reader.tx_by_hash(hash).await? else {
         return Err(ApiError::NotFound);
     };
-    let (transfers, count) = tx_transfer_page(&state, &data, MAX_PER_PAGE, 0).await?;
     let mut item = build_api_transaction(&data, InputMode::Detail);
-    item.token_transfers = Some(transfers);
-    item.token_transfer_count = Some(count);
+    if data.block_number <= state.status.last_indexed().unwrap_or(0) {
+        let (transfers, count) = tx_transfer_page(&state, &data, MAX_PER_PAGE, 0).await?;
+        item.token_transfers = Some(transfers);
+        item.token_transfer_count = Some(count);
+    }
     Ok(Json(item))
 }
 
@@ -980,11 +990,11 @@ async fn call(
 // ---------------------------------------------------------------------------
 
 /// The execution blocks one consensus output produced, from the indexer's
-/// `consensus_blocks` table keyed by the output's wire digest (one pooled
+/// `consensus_blocks` table keyed by the output's header digest (one pooled
 /// read). `None` = not indexed yet, or an empty non-closing output.
 async fn consensus_exec_range(
     state: &ApiState,
-    digest: String,
+    digest: B256,
 ) -> Result<Option<ApiExecRange>, ApiError> {
     Ok(state
         .pool
@@ -1034,15 +1044,19 @@ async fn consensus_blocks_list(
         .map(|header| build_consensus_header(header, None))
         .collect();
     // execution ranges for the whole page in ONE pooled read, keyed by the
-    // wire digest (the `consensus_blocks` key encoding)
+    // header digest
     if !items.is_empty() {
-        let digests: Vec<String> = items.iter().map(|item| item.digest.clone()).collect();
+        let digests: Vec<B256> = headers
+            .iter()
+            .map(|header| B256::from(header.digest()))
+            .collect();
+        let lookup = digests.clone();
         let ranges = state
             .pool
-            .with_conn(move |conn| Ok(storage::consensus_ranges_by_digests(conn, &digests)?))
+            .with_conn(move |conn| Ok(storage::consensus_ranges_by_digests(conn, &lookup)?))
             .await?;
-        for item in &mut items {
-            item.exec_blocks = ranges.get(&item.digest).copied().map(exec_range);
+        for (item, digest) in items.iter_mut().zip(&digests) {
+            item.exec_blocks = ranges.get(digest).copied().map(exec_range);
         }
     }
     Ok(Json(Envelope {
@@ -1069,7 +1083,8 @@ async fn consensus_block(
     // the output carries every header field (`consensus_header()` rebuilds it
     // over the Arc-backed sub-dag), so no second actor read is needed
     let mut header = build_consensus_header(&output.consensus_header(), None);
-    let exec_blocks = consensus_exec_range(&state, header.digest.clone()).await?;
+    let exec_blocks =
+        consensus_exec_range(&state, B256::from(output.consensus_header_hash())).await?;
     let batches = build_consensus_batches(&output, exec_blocks.as_ref(), false);
     header.exec_blocks = exec_blocks;
     let epoch = header.epoch;
@@ -1104,30 +1119,42 @@ async fn consensus_block_batches(
     let Some(output) = state.reader.consensus_output(number).await? else {
         return Err(ApiError::NotFound);
     };
-    let digest = hex_digest(&output.consensus_header_hash());
-    let exec_blocks = consensus_exec_range(&state, digest.clone()).await?;
+    let digest = output.consensus_header_hash();
+    let exec_blocks = consensus_exec_range(&state, B256::from(digest)).await?;
     Ok(Json(ApiConsensusBatches {
         number: output.number(),
-        digest,
+        digest: hex_digest(&digest),
         batches: build_consensus_batches(&output, exec_blocks.as_ref(), true),
     }))
 }
 
 /// Build one `/consensus/epochs` row from the epoch's record pair (two to
-/// three actor reads). `detail` BLS-verifies the certificate and adds the
-/// fields that cost more reads — `committee_addresses` (a pinned registry
-/// read), `pack_complete`, `last_committed_rounds` and
-/// `final_reputation_scores` (one pack read each, `null` when the pack is
-/// not local); lists leave them `null`. `end_time` is left for the caller to
-/// batch.
+/// three actor reads). `current` is the caller's ONE snapshot of
+/// `latest_consensus_epoch()` per request, so every row of a page and the
+/// detail route's 404 check agree on which epoch is current.
+///
+/// Exactly as [`epoch_row`], the current epoch's record is hidden even when
+/// it already exists: TN writes record N while the latest epoch is still N
+/// (until the first output of N+1 is saved), and a from-genesis chain seeds
+/// an epoch-0 record with `final_consensus.number == 0`; without the filter
+/// the current row would show a closed range and a certificate.
+///
+/// `detail` BLS-verifies the certificate and adds the fields that cost more
+/// reads — `committee_addresses` (a pinned registry read), `pack_complete`,
+/// `last_committed_rounds` and `final_reputation_scores` (one pack read
+/// each). `pack_complete` is `false`, not `null`, when the pack is absent or
+/// unreadable (TN's `is_epoch_complete` collapses those with "incomplete");
+/// the other two are `null` when the pack is not local. Lists leave all four
+/// `null`. `end_time` is left for the caller to batch.
 async fn consensus_epoch_row(
     reader: &NodeReader,
     epoch: u32,
+    current: u32,
     detail: bool,
 ) -> Result<ApiConsensusEpoch, ApiError> {
+    let is_current = epoch == current;
     let (this, previous) = reader.epoch_record_pair(epoch).await;
-    let is_current = epoch == reader.latest_consensus_epoch();
-    let (record, certificate) = match this {
+    let (record, certificate) = match this.filter(|_| !is_current) {
         Some((record, certificate)) => (Some(record), certificate),
         None => (None, None),
     };
@@ -1141,17 +1168,25 @@ async fn consensus_epoch_row(
         is_current,
         record: record.as_ref().map(build_epoch_record),
         certificate,
-        // the first stored output is 1; epoch 0 starts at block 0
+        // the first stored output is 1; epoch 0 starts at block 0. A missing
+        // predecessor record renders `first` null rather than a guessed
+        // number (the epoch DB is dense, so a healthy node never hits this)
         consensus_range: ApiRange {
-            first: previous.as_ref().map_or(1, |previous| {
-                previous.final_consensus.number.saturating_add(1)
-            }),
+            first: match epoch {
+                0 => Some(1),
+                _ => previous
+                    .as_ref()
+                    .map(|previous| previous.final_consensus.number.saturating_add(1)),
+            },
             last: record.as_ref().map(|record| record.final_consensus.number),
         },
         exec_range: ApiRange {
-            first: previous
-                .as_ref()
-                .map_or(0, |previous| previous.final_state.number.saturating_add(1)),
+            first: match epoch {
+                0 => Some(0),
+                _ => previous
+                    .as_ref()
+                    .map(|previous| previous.final_state.number.saturating_add(1)),
+            },
             last: record.as_ref().map(|record| record.final_state.number),
         },
         end_time: None,
@@ -1196,12 +1231,14 @@ async fn consensus_epochs_list(
     Query(query): Query<PageQuery>,
 ) -> ApiResult<Envelope<ApiConsensusEpoch>> {
     let (page, per_page, _) = page_params(&query);
-    let total = u64::from(state.reader.latest_consensus_epoch()).saturating_add(1);
+    // one snapshot of the current epoch for the whole page
+    let current = state.reader.latest_consensus_epoch();
+    let total = u64::from(current).saturating_add(1);
     let numbers = node_reads::desc_page_items(total, page, per_page);
 
     let mut items = Vec::with_capacity(numbers.len());
     for number in numbers {
-        items.push(consensus_epoch_row(&state.reader, epoch_u32(number), false).await?);
+        items.push(consensus_epoch_row(&state.reader, epoch_u32(number), current, false).await?);
     }
 
     // boundary timestamps for the whole page in ONE blocking read
@@ -1235,10 +1272,11 @@ async fn consensus_epoch(
     Path(raw): Path<String>,
 ) -> ApiResult<ApiConsensusEpoch> {
     let number = parse_number(&raw, "epoch number")?;
-    if number > u64::from(state.reader.latest_consensus_epoch()) {
+    let current = state.reader.latest_consensus_epoch();
+    if number > u64::from(current) {
         return Err(ApiError::NotFound);
     }
-    let mut item = consensus_epoch_row(&state.reader, epoch_u32(number), true).await?;
+    let mut item = consensus_epoch_row(&state.reader, epoch_u32(number), current, true).await?;
     if let Some(end_block) = item.exec_range.last {
         let times = state.reader.header_timestamps(vec![end_block]).await?;
         item.end_time = times.get(&end_block).copied();

@@ -16,14 +16,21 @@
 //!
 //! Consensus numbers are guarded to `1..=latest_consensus_number()` BEFORE the
 //! pack is touched: number 0 is the pre-genesis anchor (never stored) and a
-//! current-epoch miss surfaces as `Err`, not `None`. One race is tolerated —
-//! `latest_consensus_number()` can briefly lead the pack write it announces, so
-//! a failed read at exactly `latest` degrades to "absent" with a `warn!`
-//! instead of a 500 (see [`tolerate_tip_race`]). Per-epoch pack helpers
-//! degrade to `None` + `warn!` when the pack is not held locally, which is a
-//! normal observer state. The one CPU-bound consensus operation, BLS
-//! certificate verification, runs under the blocking permit like a `RethEnv`
-//! read — see [`NodeReader::verify_epoch_certificate`].
+//! current-epoch miss surfaces as `Err`, not `None`. The in-memory latest
+//! counter is updated only after the pack write is acknowledged (TN
+//! `crates/storage/src/consensus.rs`: `save_consensus_output(..).await?` and
+//! only then `latest_consensus.update(..)`), so any number `<= latest` is
+//! readable by construction and a current-epoch `Err` is a real read failure,
+//! never a tip race. For a SEALED epoch, TN's by-number reads answer an absent
+//! pack and a pack that cannot be opened (truncated, corrupt) identically with
+//! `Ok(None)`; only the by-digest read preserves the error. So a by-number
+//! miss below the tip is "absent locally or unreadable" — a normal observer
+//! state rendered as 404 / `null`, with the node log and the by-digest
+//! `/blocks/{n}` path as the diagnostics. Per-epoch pack helpers likewise
+//! degrade to `None` + `warn!` when the pack is not held locally. The one
+//! CPU-bound consensus operation, BLS certificate verification, runs under the
+//! blocking permit like a `RethEnv` read — see
+//! [`NodeReader::verify_epoch_certificate`].
 //!
 //! Per-epoch committee reads must name their pin: tn-reth has no unpinned
 //! per-epoch committee reader, because the registry mutates the CURRENT
@@ -585,7 +592,10 @@ impl NodeReader {
     // ----- consensus chain: async actor reads, no permit -----
 
     /// The newest consensus output number the node has processed. Sync: an
-    /// in-memory atomic, no actor round-trip. Stored outputs are `1..=this`.
+    /// in-memory atomic, no actor round-trip. It advances only after the
+    /// output's pack write is acknowledged, so every number in `1..=this` is
+    /// readable by construction (the pack tail can be one output AHEAD of it
+    /// while a write is in flight, never behind).
     pub fn latest_consensus_number(&self) -> u64 {
         self.consensus.latest_consensus_number()
     }
@@ -602,26 +612,37 @@ impl NodeReader {
     ///
     /// `Ok(None)` outside `1..=latest_consensus_number()` with no pack touch
     /// (see [`consensus_number_stored`]) and for a sealed epoch whose pack this
-    /// observer does not hold. `Err` for a pack that exists but cannot be read
-    /// — except at exactly the tip, where the transient race is tolerated as
-    /// `Ok(None)` (see [`tolerate_tip_race`]).
+    /// observer does not hold OR cannot open (absent, truncated and corrupt
+    /// all collapse to `Ok(None)` in TN's `consensus_output_by_number`, so a
+    /// 404 alone does not prove the pack is absent: check the node log and
+    /// `/blocks/{n}.consensus.consensus_number`, which resolves by digest and
+    /// surfaces the real error as a `warn!`). `Err` for a current-epoch read
+    /// failure or a sealed pack that opens but cannot be read — always a real
+    /// fault, because the latest counter advances only after the pack write
+    /// is acknowledged (there is no tip race to tolerate).
     pub async fn consensus_output(&self, number: u64) -> eyre::Result<Option<ConsensusOutput>> {
-        let latest = self.latest_consensus_number();
-        if !consensus_number_stored(number, latest) {
+        if !consensus_number_stored(number, self.latest_consensus_number()) {
             return Ok(None);
         }
-        tolerate_tip_race(
-            self.consensus.consensus_output_by_number(number).await,
-            number,
-            latest,
-        )
+        self.consensus
+            .consensus_output_by_number(number)
+            .await
+            .map_err(chain_err)
     }
 
     /// The newest consensus header (serves `/consensus/latest`): one actor
-    /// round-trip into the current pack. `Ok(None)` before the first output.
+    /// round-trip for the header numbered `latest_consensus_number()`, NOT
+    /// the pack's own tail — the tail can be one output ahead of the counter
+    /// while a write is in flight, and reading by the counter keeps `number`
+    /// consistent with the bounds guard on `/consensus/blocks/{n}` and with
+    /// `/consensus/blocks.total`. `Ok(None)` before the first output.
     pub async fn consensus_latest_header(&self) -> eyre::Result<Option<ConsensusHeader>> {
+        let latest = self.latest_consensus_number();
+        if latest == 0 {
+            return Ok(None);
+        }
         self.consensus
-            .consensus_header_latest()
+            .consensus_header_by_number(latest)
             .await
             .map_err(chain_err)
     }
@@ -632,9 +653,10 @@ impl NodeReader {
     /// Numbers come from [`consensus_page_numbers`]; each is one sequential
     /// actor round-trip (the actor serializes them regardless), so a page
     /// costs `per_page` header decodes. Rows this observer lacks (`Ok(None)`:
-    /// a sealed epoch's pack not held locally) and a tip-race miss are SKIPPED
-    /// with one summarizing `warn!` — the page shrinks rather than failing, and
-    /// `total` still reports the chain's count. Any other `Err` fails the page.
+    /// a sealed epoch's pack absent locally or unreadable — TN's by-number
+    /// read does not distinguish the two) are SKIPPED with one summarizing
+    /// `warn!` — the page shrinks rather than failing, and `total` still
+    /// reports the chain's count. An `Err` fails the page.
     pub async fn consensus_headers_page(
         &self,
         page: u64,
@@ -645,8 +667,12 @@ impl NodeReader {
         let mut headers = Vec::with_capacity(numbers.len());
         let mut skipped: Vec<u64> = Vec::new();
         for number in numbers {
-            let result = self.consensus.consensus_header_by_number(number).await;
-            match tolerate_tip_race(result, number, total)? {
+            match self
+                .consensus
+                .consensus_header_by_number(number)
+                .await
+                .map_err(chain_err)?
+            {
                 Some(header) => headers.push(header),
                 None => skipped.push(number),
             }
@@ -654,7 +680,7 @@ impl NodeReader {
         if let (Some(newest), Some(oldest)) = (skipped.first(), skipped.last()) {
             warn!(
                 count = skipped.len(),
-                newest, oldest, "consensus headers absent locally; page shrunk"
+                newest, oldest, "consensus headers absent locally or unreadable; page shrunk"
             );
         }
         Ok((headers, total))
@@ -711,8 +737,10 @@ impl NodeReader {
 
     /// Whether this observer holds `record`'s epoch pack through its final
     /// output (serves `pack_complete` on `/consensus/epochs/{n}`): one header
-    /// read of `record.final_consensus.number`. A read error counts as
-    /// incomplete (TN logs it at `error!`).
+    /// read of `record.final_consensus.number`. `false` when the pack is
+    /// absent, truncated or corrupt as well as when it is genuinely
+    /// incomplete — TN's `is_epoch_complete` collapses an `Ok(None)` and a
+    /// read error (logged at `error!`) alike.
     pub async fn epoch_pack_complete(&self, record: &EpochRecord) -> bool {
         self.consensus.is_epoch_complete(record).await
     }
@@ -809,31 +837,6 @@ impl NodeReader {
 /// preserved for downcasting instead of being flattened to its message.
 fn chain_err(e: ConsensusChainError) -> eyre::Report {
     eyre::Report::new(e)
-}
-
-/// Map one numbered pack read: a typed `Err` becomes `eyre` — EXCEPT at
-/// exactly the tip. `latest_consensus_number()` is an in-memory atomic that
-/// can briefly lead the pack write it announces, and a current-epoch miss is
-/// `Err`, not `None`; so a failure at `number == latest` is treated as a
-/// transient "not readable yet" (`Ok(None)`, one `warn!`) rather than a 500 on
-/// every tip poll. Anywhere below the tip the error is real and propagates.
-fn tolerate_tip_race<T>(
-    result: Result<Option<T>, ConsensusChainError>,
-    number: u64,
-    latest: u64,
-) -> eyre::Result<Option<T>> {
-    match result {
-        Err(e) if number == latest => {
-            warn!(
-                number,
-                latest,
-                error = %e,
-                "consensus tip not yet readable; treating as absent"
-            );
-            Ok(None)
-        }
-        other => other.map_err(chain_err),
-    }
 }
 
 /// Whether `number` can name a stored consensus output given the tip
@@ -1086,23 +1089,6 @@ mod tests {
         assert!(!consensus_number_stored(11, 10));
         // nothing processed yet: nothing stored
         assert!(!consensus_number_stored(1, 0));
-    }
-
-    #[test]
-    fn tip_race_tolerated_only_at_latest() {
-        // a failure at exactly the tip is a transient miss
-        assert!(matches!(
-            tolerate_tip_race::<u8>(Err(ConsensusChainError::NoCurrentEpoch), 5, 5),
-            Ok(None)
-        ));
-        // below the tip the error is real
-        assert!(tolerate_tip_race::<u8>(Err(ConsensusChainError::NoCurrentEpoch), 4, 5).is_err());
-        // successes and legitimate absences pass through untouched
-        assert!(matches!(
-            tolerate_tip_race(Ok(Some(7u8)), 5, 5),
-            Ok(Some(7))
-        ));
-        assert!(matches!(tolerate_tip_race::<u8>(Ok(None), 3, 5), Ok(None)));
     }
 
     #[test]

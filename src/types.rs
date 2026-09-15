@@ -53,10 +53,12 @@ pub const DEFAULT_PER_PAGE: u64 = 25;
 pub const MAX_PER_PAGE: u64 = 100;
 
 /// The list envelope every paged endpoint returns; `page` is 0-based and items
-/// are newest-first.
+/// are newest-first, with one exception: `/txs/{hash}/transfers` is in
+/// ascending `log_index` (emission) order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
-    /// The page of items, newest first.
+    /// The page of items, newest first (ascending `log_index` on
+    /// `/txs/{hash}/transfers`).
     pub items: Vec<T>,
     /// Total number of items across all pages.
     pub total: u64,
@@ -407,8 +409,11 @@ pub struct ApiConsensusNumHash {
 /// in progress).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRange {
-    /// First number (inclusive).
-    pub first: u64,
+    /// First number (inclusive): epoch 0 starts at 0 (execution) / 1
+    /// (consensus); epoch N > 0 starts one past epoch N-1's record. `null`
+    /// when that predecessor record could not be read — `EpochRecordDb` is
+    /// dense, so on a healthy node this never happens.
+    pub first: Option<u64>,
     /// Last number (inclusive); `null` for the current epoch.
     pub last: Option<u64>,
 }
@@ -528,15 +533,22 @@ pub struct ApiConsensusBatch {
     /// Position in `ConsensusOutput::flatten_batches()` order — which is also
     /// the batch's position among the execution blocks this output produced.
     pub index: u64,
-    /// `Batch::digest()` (`BlockHash`) as 0x hex; equals the execution
-    /// block's `ommers_hash`.
+    /// The batch digest (`BlockHash`) as 0x hex, taken from the output's
+    /// `batch_digests()` deque at this position — the pairing the engine
+    /// executes with, so it always equals the execution block's
+    /// `ommers_hash`. It equals `Batch::digest()` of this row's batch EXCEPT
+    /// on adiri outputs in epochs <= `ADIRI_DUP_BATCH_EPOCH` with duplicate
+    /// payload keys, where the engine deliberately mispairs the same way.
     pub digest: String,
     /// `Batch::worker_id`.
     pub worker_id: u16,
-    /// `Batch::beneficiary` — the execution block's coinbase (0x hex).
+    /// `Batch::beneficiary` — the PRODUCING worker's configured execution
+    /// address (from that node's node-info), 0x hex. Not necessarily the
+    /// execution block's coinbase, which is `authority_address`.
     pub beneficiary: String,
-    /// `CertifiedBatch::address` — the authority that produced the batch
-    /// (0x hex; may repeat within an output).
+    /// `CertifiedBatch::address` — the authority whose header certified the
+    /// batch (0x hex; may repeat within an output). This is the execution
+    /// block's coinbase, `/blocks/{n}.miner`.
     pub authority_address: String,
     /// `Batch::base_fee_per_gas`.
     pub base_fee_per_gas: u64,
@@ -545,7 +557,10 @@ pub struct ApiConsensusBatch {
     /// `Batch::size()` — struct size plus raw transaction bytes.
     pub size_bytes: usize,
     /// `exec_blocks.first + index` when the output's execution range is
-    /// known; `null` otherwise.
+    /// known AND already covers this batch (`<= exec_blocks.last`); `null`
+    /// otherwise. The indexer commits one block per SQLite transaction, so
+    /// mid-output the range can be shorter than the batch list and the
+    /// trailing batches are `null` like `exec_blocks` itself.
     pub exec_block_number: Option<u64>,
     /// `keccak256` of each raw EIP-2718 transaction (== its tx hash).
     /// Present on `/consensus/blocks/{n}/batches` only.
@@ -589,7 +604,10 @@ pub struct ApiConsensusBatches {
 /// `GET /consensus/latest`: the newest consensus header plus the execution tip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConsensusLatest {
-    /// `ConsensusChain::latest_consensus_number()`.
+    /// `ConsensusChain::latest_consensus_number()` — the header is read by
+    /// that number (not the pack's tail, which can be one output ahead while
+    /// a write is in flight), so it agrees with `/consensus/blocks.total` and
+    /// the bounds of `/consensus/blocks/{n}`.
     pub number: u64,
     /// Leader epoch of the latest header.
     pub epoch: u32,
@@ -668,17 +686,20 @@ pub struct ApiEpochCertificate {
 pub struct ApiConsensusEpoch {
     /// Epoch number.
     pub epoch: u64,
-    /// Whether this is the in-progress epoch (no record yet).
+    /// Whether this is the in-progress epoch. Its record, if the node has
+    /// already written it, is hidden until the epoch stops being current.
     pub is_current: bool,
     /// The epoch record; `null` for the current epoch.
     pub record: Option<ApiEpochRecord>,
     /// The certificate over `record`; `null` while uncertified.
     pub certificate: Option<ApiEpochCertificate>,
     /// Consensus block numbers: `{prev.final_consensus.number + 1 (1 for epoch
-    /// 0), record.final_consensus.number}`; `last` null while current.
+    /// 0), record.final_consensus.number}`; `last` null while current,
+    /// `first` null only if the predecessor record is unreadable.
     pub consensus_range: ApiRange,
     /// Execution block numbers: `{prev.final_state.number + 1 (0 for epoch
-    /// 0), record.final_state.number}`; `last` null while current.
+    /// 0), record.final_state.number}`; `last` null while current, `first`
+    /// null only if the predecessor record is unreadable.
     pub exec_range: ApiRange,
     /// Timestamp of the epoch's last execution block; `null` while current.
     pub end_time: Option<u64>,
@@ -688,7 +709,10 @@ pub struct ApiConsensusEpoch {
     /// `null` on lists or when the pin cannot be resolved.
     pub committee_addresses: Option<Vec<String>>,
     /// Detail only: `ConsensusChain::is_epoch_complete(record)` — whether the
-    /// epoch's consensus pack is fully present locally; `null` on lists.
+    /// epoch's final output is readable from its local pack. `false` when the
+    /// pack is absent, truncated or corrupt as well as when it is genuinely
+    /// incomplete (TN collapses those); `null` only for the current epoch
+    /// (no record yet) and on lists.
     pub pack_complete: Option<bool>,
     /// Detail only: `ConsensusChain::read_last_committed(epoch)`, sorted;
     /// `null` on lists or when the pack is not local.
@@ -712,12 +736,16 @@ pub struct ApiBlockConsensus {
     pub epoch: u32,
     /// Low 32 bits of `nonce` (`deconstruct_nonce`).
     pub round: u32,
-    /// `difficulty >> 16` — the batch's `flatten_batches()` index.
+    /// `difficulty >> 16` — the batch's `flatten_batches()` index; the single
+    /// empty block of an empty epoch-closing output carries the placeholder 0.
     pub batch_index: u64,
-    /// `difficulty & 0xffff` — the producing worker.
+    /// `difficulty & 0xffff` — the producing worker; placeholder 0 on that
+    /// empty epoch-closing block.
     pub worker_id: u16,
-    /// `ommers_hash` = `Batch::digest()` (0x hex; ZERO for the empty block an
-    /// epoch-closing output with no batches produces).
+    /// `ommers_hash` — the digest the engine paired with this block from the
+    /// output's `batch_digests()` deque (see `ApiConsensusBatch.digest`), 0x
+    /// hex; ZERO for the empty block an epoch-closing output with no batches
+    /// produces.
     pub batch_digest: String,
     /// `mix_hash` = prev_randao (0x hex), when set.
     pub prev_randao: Option<String>,
@@ -1028,7 +1056,13 @@ pub fn build_consensus_batches(
         .map(|(index, (cert_idx, batch_idx))| {
             let cert = &certified[cert_idx];
             let batch = &cert.batches[batch_idx];
-            // prefer the output's cached digest list; recompute only if absent
+            // the output's digest deque, paired by position exactly as the
+            // engine does (`get_batch_digest(batch_index)` in TN's payload
+            // builder) — on adiri outputs at or below `ADIRI_DUP_BATCH_EPOCH`
+            // with duplicate payload keys this differs from `batch.digest()`,
+            // and the engine's pairing is what the exec block records. The
+            // deque is never shorter than the flatten list; the recompute is
+            // defensive only.
             let digest = out
                 .get_batch_digest(index)
                 .unwrap_or_else(|| batch.digest());
@@ -1042,7 +1076,13 @@ pub fn build_consensus_batches(
                 base_fee_per_gas: batch.base_fee_per_gas,
                 tx_count: batch.transactions.len(),
                 size_bytes: batch.size(),
-                exec_block_number: exec_blocks.map(|r| r.first + index),
+                // only blocks the indexer has committed: the range grows one
+                // block at a time, so mid-output it can be shorter than the
+                // batch list
+                exec_block_number: exec_blocks.and_then(|r| {
+                    let n = r.first + index;
+                    (n <= r.last).then_some(n)
+                }),
                 tx_hashes: with_tx_hashes.then(|| batch_tx_hashes(batch)),
             }
         })
@@ -1384,6 +1424,19 @@ mod tests {
     // ------------------------------------------------------------------
     // Encoding helpers
     // ------------------------------------------------------------------
+
+    /// The `consensus_blocks` key (`storage::digest_hex`) and the wire digest
+    /// helpers are one encoding, so a range looked up by a header's `B256`
+    /// digest is the row the indexer wrote from `parent_beacon_block_root`.
+    #[test]
+    fn storage_digest_key_matches_wire_digest_encoding() {
+        let b = B256::from(core::array::from_fn::<u8, 32, _>(|i| {
+            (i as u8).wrapping_mul(0x1f).wrapping_add(0xa5)
+        }));
+        assert_eq!(crate::storage::digest_hex(&b), hex_digest(&b));
+        assert_eq!(hex_digest(&b), hex_b256(&b));
+        assert_eq!(hex_b256(&b).len(), 66);
+    }
 
     #[test]
     fn bs58_digest_is_full_and_newtype_display_is_its_prefix() {
@@ -1795,6 +1848,18 @@ mod tests {
         let value = serde_json::to_value(&summaries[0]).expect("to_value");
         assert!(value.get("tx_hashes").is_none());
         assert_eq!(value["exec_block_number"], 100);
+
+        // a range the indexer has only partly committed (one block per SQLite
+        // transaction): batches past `last` render null, like `exec_blocks`
+        let partial = ApiExecRange {
+            first: 100,
+            last: 101,
+        };
+        let numbers: Vec<Option<u64>> = build_consensus_batches(&out, Some(&partial), false)
+            .iter()
+            .map(|b| b.exec_block_number)
+            .collect();
+        assert_eq!(numbers, vec![Some(100), Some(101), None]);
 
         // unknown range => null exec numbers; with hashes => keccak256(raw) == tx.hash()
         let detailed = build_consensus_batches(&out, None, true);

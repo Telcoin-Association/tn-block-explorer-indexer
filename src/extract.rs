@@ -143,9 +143,11 @@ pub struct ConsensusRow {
 /// - `nonce` = sub-dag leader's `(epoch << 32) | round`
 ///   (`tn-types/src/primary/header.rs:213`) → [`epoch`](Self::epoch), [`round`](Self::round)
 /// - `difficulty` = `(batch_index << 16) | worker_id` → [`batch_index`](Self::batch_index),
-///   [`worker_id`](Self::worker_id)
-/// - `ommers_hash` = `Batch::digest()`; `B256::ZERO` for the empty epoch-closing
-///   block → [`batch_digest`](Self::batch_digest)
+///   [`worker_id`](Self::worker_id); both are the placeholder 0 on the single
+///   empty block of an empty epoch-closing output (`engine/src/payload_builder.rs`:
+///   `TNPayload::new(.., 0, B256::ZERO, .., 0)`)
+/// - `ommers_hash` = the output's batch digest paired with this block;
+///   `B256::ZERO` for the empty epoch-closing block → [`batch_digest`](Self::batch_digest)
 /// - `mix_hash` = EIP-4399 prev_randao → [`prev_randao`](Self::prev_randao)
 /// - `extra_data` = committee-shuffle seed, non-empty ONLY on the epoch-closing
 ///   block → [`closes_epoch`](Self::closes_epoch)
@@ -157,11 +159,14 @@ pub struct HeaderConsensusFields {
     pub epoch: u32,
     /// Consensus round of the leader certificate (lower 32 bits of `nonce`).
     pub round: u32,
-    /// Position of this block's batch within its output (`difficulty >> 16`).
+    /// Position of this block's batch within its output (`difficulty >> 16`);
+    /// placeholder 0 on the empty block of an empty epoch-closing output.
     pub batch_index: u64,
-    /// Worker that built the batch (`difficulty & 0xffff`).
+    /// Worker that built the batch (`difficulty & 0xffff`); placeholder 0 on
+    /// that empty epoch-closing block.
     pub worker_id: u16,
-    /// `Batch::digest()` of the executed batch (`ommers_hash`).
+    /// The batch digest the engine paired with this block (`ommers_hash`);
+    /// `B256::ZERO` on the empty epoch-closing block.
     pub batch_digest: B256,
     /// EIP-4399 prev_randao (`mix_hash`). Always `Some` for an alloy header;
     /// the `Option` mirrors `BlockHeader::mix_hash()` so the wire type can
@@ -554,6 +559,29 @@ mod tests {
             ..consensus_header(1)
         };
         assert_eq!(decode_consensus_fields(&header), None);
+    }
+
+    /// The single empty block of an empty epoch-closing output (TN
+    /// `engine/src/payload_builder.rs`: `TNPayload::new(.., 0, B256::ZERO,
+    /// .., 0)`) decodes to placeholder batch fields, never to `None`.
+    #[test]
+    fn decode_consensus_fields_empty_closing_block_carries_placeholders() {
+        let header = ExecHeader {
+            number: 4242,
+            parent_beacon_block_root: Some(B256::repeat_byte(0x0c)),
+            nonce: ((7u64 << 32) | 9).into(),
+            difficulty: U256::ZERO,
+            ommers_hash: B256::ZERO,
+            mix_hash: B256::repeat_byte(0x0c),
+            extra_data: Bytes::from(vec![0xaa; 32]),
+            ..Default::default()
+        };
+        let fields = decode_consensus_fields(&header).expect("placeholder block decodes");
+        assert_eq!(fields.digest, B256::repeat_byte(0x0c));
+        assert_eq!((fields.epoch, fields.round), (7, 9));
+        assert_eq!((fields.batch_index, fields.worker_id), (0, 0));
+        assert_eq!(fields.batch_digest, B256::ZERO);
+        assert!(fields.closes_epoch);
     }
 
     #[test]
