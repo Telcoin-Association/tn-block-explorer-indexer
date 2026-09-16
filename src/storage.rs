@@ -1,21 +1,24 @@
 //! SQLite persistence: exactly the derived indexes reth maintains in no table,
 //! plus a cursor — nothing else.
 //!
-//! Tables (schema v2): `meta` (cursor, schema version, chain id), `address_txs`
-//! (address → transaction pointers), `token_transfers` (ERC-20 transfer
-//! history), `tokens` (ERC-20 metadata cache). Blocks, transactions, and
-//! receipts deliberately have NO tables here — they are served by direct reads
-//! on the node's own databases (`node_reads`).
+//! Tables (schema v3): `meta` (cursor, schema version, chain id), `address_txs`
+//! (address → typed transaction pointers), `tx_types` (transaction type →
+//! pointers) with `tx_type_counts` (exact per-type totals), `consensus_blocks`
+//! (consensus output digest → execution block range), `token_transfers`
+//! (ERC-20 transfer history), `tokens` (ERC-20 metadata cache). Blocks,
+//! transactions, and receipts deliberately have NO tables here — they are
+//! served by direct reads on the node's own databases (`node_reads`).
 //!
 //! # Consistency & disposability
 //!
-//! One SQLite transaction per block: pointer rows, transfer rows, token upserts,
-//! and the cursor advance commit atomically, so a `kill -9` loses rows and
-//! cursor **together** (WAL rollback) and restart replays from `cursor + 1` with
-//! no holes. `INSERT OR IGNORE` makes re-indexing the same block idempotent, and
-//! TN has no reorgs so keys are permanently stable. The whole file is derived
-//! state: a `schema_version` mismatch (or leftover v1 tables) drops every table
-//! and re-replays from 0 — delete-the-file is the supported migration AND
+//! One SQLite transaction per block: pointer rows, type rows and counters, the
+//! consensus range upsert, transfer rows, token upserts, and the cursor advance
+//! commit atomically, so a `kill -9` loses rows and cursor **together** (WAL
+//! rollback) and restart replays from `cursor + 1` with no holes. `INSERT OR
+//! IGNORE` makes re-indexing the same block idempotent, and TN has no reorgs so
+//! keys are permanently stable. The whole file is derived state: a
+//! `schema_version` mismatch (or leftover v1 tables) drops every table and
+//! re-replays from 0 — delete-the-file is the supported migration AND
 //! corruption story.
 //!
 //! # Handles
@@ -33,24 +36,28 @@ use crate::extract::ExtractedBlock;
 use eyre::{bail, eyre, WrapErr};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tn_types::Address;
+use tn_types::{Address, B256};
 use tokio::sync::Semaphore;
 
 /// The schema version this build writes and requires.
-const SCHEMA_VERSION: &str = "2";
+///
+/// v3 added `address_txs.tx_type`, `tx_types`, `tx_type_counts`, and
+/// `consensus_blocks`. A v2 file is dropped and replayed from 0 (see [`migrate`]).
+const SCHEMA_VERSION: &str = "3";
 
 /// Number of read-only connections in the [`ReadPool`].
 const READ_POOL_SIZE: usize = 4;
 
-/// Schema v2 DDL. `WITHOUT ROWID` keeps the composite primary keys clustered;
+/// Schema v3 DDL. `WITHOUT ROWID` keeps the composite primary keys clustered;
 /// all hex values are lowercase `0x`-prefixed (the explorer compares with
 /// `.to_lowercase()`).
 const DDL: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
--- rows: ('schema_version','2'), ('last_indexed','<u64>'), ('chain_id','<u64>')
+-- rows: ('schema_version','3'), ('last_indexed','<u64>'), ('chain_id','<u64>')
 -- 'last_indexed' ABSENT means fresh DB (replay from 0).
 
 -- (a) address -> native-tx participation index. Pointer rows ONLY - no tx content.
@@ -58,12 +65,41 @@ CREATE TABLE IF NOT EXISTS address_txs (
     address      TEXT    NOT NULL,
     block_number INTEGER NOT NULL,
     tx_index     INTEGER NOT NULL,
+    tx_type      INTEGER NOT NULL,
     PRIMARY KEY (address, block_number, tx_index)
 ) WITHOUT ROWID;
 -- Newest-first pagination is a reverse scan of the composite PK; no secondary
 -- index needed. Self-send (from==to) collapses onto one PK via INSERT OR IGNORE.
+-- tx_type (the EIP-2718 type byte) is a payload column: `?type=` on an address
+-- page filters that address's PK range, so no second index is needed.
 
--- (b) ERC-20 transfer index, extracted from receipt logs.
+-- (b) transaction type -> pointer index (`GET /txs?type=`).
+CREATE TABLE IF NOT EXISTS tx_types (
+    tx_type      INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    tx_index     INTEGER NOT NULL,
+    PRIMARY KEY (tx_type, block_number, tx_index)
+) WITHOUT ROWID;
+-- Exact per-type totals maintained inside the block transaction; COUNT(*) over
+-- tx_types would scan a whole type (millions of rows) on every list request.
+CREATE TABLE IF NOT EXISTS tx_type_counts (
+    tx_type INTEGER PRIMARY KEY,
+    count   INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- (c) consensus output digest -> execution block range, decoded from each exec
+-- header's parent_beacon_block_root (zero ConsensusChain reads while indexing).
+CREATE TABLE IF NOT EXISTS consensus_blocks (
+    digest      TEXT    PRIMARY KEY,
+    epoch       INTEGER NOT NULL,
+    round       INTEGER NOT NULL,
+    first_block INTEGER NOT NULL,
+    last_block  INTEGER NOT NULL
+) WITHOUT ROWID;
+-- digest: lowercase 0x-prefixed hex of the 32-byte digest (66 chars, see
+-- `digest_hex`). Genesis names no output and has no row.
+
+-- (d) ERC-20 transfer index, extracted from receipt logs.
 CREATE TABLE IF NOT EXISTS token_transfers (
     block_number INTEGER NOT NULL,
     tx_index     INTEGER NOT NULL,
@@ -77,8 +113,10 @@ CREATE TABLE IF NOT EXISTS token_transfers (
 CREATE INDEX IF NOT EXISTS idx_tt_token ON token_transfers(token,     block_number, tx_index, log_index);
 CREATE INDEX IF NOT EXISTS idx_tt_from  ON token_transfers(from_addr, block_number, tx_index, log_index);
 CREATE INDEX IF NOT EXISTS idx_tt_to    ON token_transfers(to_addr,   block_number, tx_index, log_index);
+-- Per-tx transfers (`/txs/{hash}/transfers`) are a PK-prefix scan on
+-- (block_number, tx_index); no extra index.
 
--- (c) token metadata cache. Written ONLY by the indexing path.
+-- (e) token metadata cache. Written ONLY by the indexing path.
 CREATE TABLE IF NOT EXISTS tokens (
     address    TEXT PRIMARY KEY,
     name       TEXT,
@@ -94,6 +132,14 @@ CREATE TABLE IF NOT EXISTS tokens (
 /// Lowercase `0x`-prefixed hex for an address — the storage key convention.
 pub fn addr_hex(address: &Address) -> String {
     format!("{address:#x}")
+}
+
+/// Lowercase `0x`-prefixed hex for a 32-byte digest (`0x` + 64 hex chars) —
+/// the `consensus_blocks.digest` key. This is the same encoding as
+/// `types::hex_b256`, so a header's `parent_beacon_block_root` formatted by
+/// either helper is a valid lookup key.
+pub fn digest_hex(digest: &B256) -> String {
+    format!("{digest:#x}")
 }
 
 /// One token-metadata row handed to [`Writer::index_block`] by the ExEx loop
@@ -118,8 +164,8 @@ pub struct TokenRow {
     pub fetched_at: u64,
 }
 
-/// A `(block_number, tx_index)` pointer read back from `address_txs`, hydrated
-/// into full transaction data by `node_reads`.
+/// A `(block_number, tx_index)` pointer read back from `address_txs` or
+/// `tx_types`, hydrated into full transaction data by `node_reads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxPointer {
     /// Block containing the transaction.
@@ -135,6 +181,10 @@ pub struct StoredTransfer {
     pub block_number: u64,
     /// Zero-based index of the transaction within its block.
     pub tx_index: u64,
+    /// Position of the log within THIS transaction's receipt logs (not the RPC
+    /// `logIndex`). Orders the per-tx transfer list and is exposed on the wire
+    /// so the explorer can show transfers in emission order.
+    pub log_index: u64,
     /// Emitting token contract (lowercase hex).
     pub token: String,
     /// Sender (lowercase hex).
@@ -156,6 +206,21 @@ pub struct StoredToken {
     pub decimals: Option<u8>,
     /// 0 = ok, 1 = retry pending, 2 = failed (terminal).
     pub status: u8,
+}
+
+/// The inclusive range of execution blocks one consensus output produced, read
+/// back from `consensus_blocks`.
+///
+/// One block per batch in the output, so `first_block == last_block` for a
+/// single-batch output and for the empty epoch-closing block. The range only
+/// widens as blocks are applied; while an output is still being indexed the
+/// stored `last_block` lags the true one (see `/health.last_indexed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusRange {
+    /// Lowest execution block number produced by the output.
+    pub first_block: u64,
+    /// Highest execution block number produced by the output (so far).
+    pub last_block: u64,
 }
 
 /// The single writing handle: ONE connection, used only by the ExEx loop.
@@ -224,7 +289,8 @@ impl Writer {
     }
 
     /// Index one block in ONE SQLite transaction: in-transaction cursor guard,
-    /// pointer + transfer rows, token upserts, cursor advance, commit.
+    /// pointer + type + consensus + transfer rows, token upserts, cursor
+    /// advance, commit.
     ///
     /// Returns `false` when the block is at or below the cursor (skipped) —
     /// the authoritative monotonic guard for the replay/live overlap.
@@ -260,11 +326,11 @@ fn configure(conn: &Connection) -> eyre::Result<()> {
 
 /// Create or rebuild the schema and enforce the chain-id guard.
 ///
-/// The DB is disposable derived state: a `schema_version` ≠ 2 (or leftover v1
-/// `blocks`/`transactions` tables) drops every table so the indexer re-replays
-/// from 0. A stored chain id different from the node's chainspec is a hard
-/// error (guards against pointing an old sqlite file at another network's
-/// datadir).
+/// The DB is disposable derived state: a `schema_version` ≠ 3 (v2 lacks
+/// `address_txs.tx_type` and the type/consensus tables; v1 left `blocks`/
+/// `transactions` tables) drops every table so the indexer re-replays from 0.
+/// A stored chain id different from the node's chainspec is a hard error
+/// (guards against pointing an old sqlite file at another network's datadir).
 fn migrate(conn: &Connection, chain_id: u64) -> eyre::Result<()> {
     let meta_exists = table_exists(conn, "meta")?;
     let v1_tables = table_exists(conn, "blocks")? || table_exists(conn, "transactions")?;
@@ -277,6 +343,9 @@ fn migrate(conn: &Connection, chain_id: u64) -> eyre::Result<()> {
     if (meta_exists && version.as_deref() != Some(SCHEMA_VERSION)) || v1_tables {
         conn.execute_batch(
             "DROP TABLE IF EXISTS address_txs;
+             DROP TABLE IF EXISTS tx_types;
+             DROP TABLE IF EXISTS tx_type_counts;
+             DROP TABLE IF EXISTS consensus_blocks;
              DROP TABLE IF EXISTS token_transfers;
              DROP TABLE IF EXISTS tokens;
              DROP TABLE IF EXISTS meta;
@@ -364,12 +433,62 @@ fn apply_block(
 
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO address_txs (address, block_number, tx_index) \
-             VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO address_txs (address, block_number, tx_index, tx_type) \
+             VALUES (?1, ?2, ?3, ?4)",
         )?;
         for row in &extracted.address_rows {
-            stmt.execute((addr_hex(&row.address), row.block_number, row.tx_index))?;
+            stmt.execute((
+                addr_hex(&row.address),
+                row.block_number,
+                row.tx_index,
+                row.tx_type,
+            ))?;
         }
+    }
+
+    {
+        // Type index + exact per-type totals. The cursor guard above admits
+        // each block exactly once and this whole function commits or rolls
+        // back with the cursor, so adding the number of rows the INSERT
+        // actually stored (`execute` reports 0 for an ignored duplicate) keeps
+        // `tx_type_counts` equal to `COUNT(*)` per type without ever scanning
+        // `tx_types`.
+        let mut inserted: BTreeMap<u8, u64> = BTreeMap::new();
+        let mut rows = tx.prepare_cached(
+            "INSERT OR IGNORE INTO tx_types (tx_type, block_number, tx_index) \
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for row in &extracted.tx_types {
+            let changed = rows.execute((row.tx_type, row.block_number, row.tx_index))?;
+            *inserted.entry(row.tx_type).or_default() += changed as u64;
+        }
+        let mut totals = tx.prepare_cached(
+            "INSERT INTO tx_type_counts (tx_type, count) VALUES (?1, ?2) \
+             ON CONFLICT(tx_type) DO UPDATE SET count = count + excluded.count",
+        )?;
+        for (tx_type, count) in inserted {
+            totals.execute((tx_type, count))?;
+        }
+    }
+
+    if let Some(consensus) = &extracted.consensus {
+        // One row per output digest whose exec range widens as each block the
+        // output produced is applied. min/max rather than "first writer wins"
+        // makes the result independent of arrival order, even though the
+        // cursor guard already forces ascending blocks.
+        tx.prepare_cached(
+            "INSERT INTO consensus_blocks (digest, epoch, round, first_block, last_block) \
+             VALUES (?1, ?2, ?3, ?4, ?4) \
+             ON CONFLICT(digest) DO UPDATE SET \
+                first_block = min(first_block, excluded.first_block), \
+                last_block = max(last_block, excluded.last_block)",
+        )?
+        .execute((
+            digest_hex(&consensus.digest),
+            consensus.epoch,
+            consensus.round,
+            consensus.block_number,
+        ))?;
     }
 
     {
@@ -432,6 +551,13 @@ fn apply_block(
 // Read side (API queries; sync helpers shared by the pool and tests)
 // ---------------------------------------------------------------------------
 
+fn pointer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TxPointer> {
+    Ok(TxPointer {
+        block_number: row.get(0)?,
+        tx_index: row.get(1)?,
+    })
+}
+
 /// Count of pointer rows for an address (the address page's `total`).
 pub fn count_address_txs(conn: &Connection, address: &str) -> rusqlite::Result<u64> {
     conn.prepare_cached("SELECT COUNT(*) FROM address_txs WHERE address = ?1")?
@@ -453,18 +579,117 @@ pub fn address_txs_page(
         "SELECT block_number, tx_index FROM address_txs WHERE address = ?1 \
          ORDER BY block_number DESC, tx_index DESC LIMIT ?2 OFFSET ?3",
     )?;
-    let rows = stmt.query_map((address, limit, offset), |row| {
-        Ok(TxPointer {
-            block_number: row.get(0)?,
-            tx_index: row.get(1)?,
-        })
-    })?;
+    let rows = stmt.query_map((address, limit, offset), pointer_from_row)?;
     rows.collect()
 }
 
-/// Column list shared by the transfer page queries. `log_index` is selected
-/// only so the post-UNION `ORDER BY` can reference it; the wire rows carry no
-/// log index (the explorer's `TokenTransfer` has none).
+/// Count of an address's pointer rows with one EIP-2718 type (the `total` of
+/// `/address/{addr}/txs?type=`).
+///
+/// A filtered walk of that address's PK range rather than a second index:
+/// per-address volumes are small, and `tx_type` lives in the row.
+pub fn count_address_txs_by_type(
+    conn: &Connection,
+    address: &str,
+    tx_type: u8,
+) -> rusqlite::Result<u64> {
+    conn.prepare_cached("SELECT COUNT(*) FROM address_txs WHERE address = ?1 AND tx_type = ?2")?
+        .query_row((address, tx_type), |row| row.get(0))
+}
+
+/// One newest-first page of an address's pointers restricted to one EIP-2718
+/// type — [`address_txs_page`] with `AND tx_type = ?`.
+pub fn address_txs_page_by_type(
+    conn: &Connection,
+    address: &str,
+    tx_type: u8,
+    limit: u64,
+    offset: u64,
+) -> rusqlite::Result<Vec<TxPointer>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT block_number, tx_index FROM address_txs WHERE address = ?1 AND tx_type = ?2 \
+         ORDER BY block_number DESC, tx_index DESC LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = stmt.query_map((address, tx_type, limit, offset), pointer_from_row)?;
+    rows.collect()
+}
+
+/// Total transactions of one EIP-2718 type (the `total` of `/txs?type=`), from
+/// the `tx_type_counts` counter — O(1), exact because the counter is updated
+/// in the same transaction that inserts the rows (see [`apply_block`]). A type
+/// never seen (e.g. EIP-4844, which TN's batch allowlist rejects) has no row
+/// and counts as 0.
+pub fn count_tx_type(conn: &Connection, tx_type: u8) -> rusqlite::Result<u64> {
+    let count: Option<u64> = conn
+        .prepare_cached("SELECT count FROM tx_type_counts WHERE tx_type = ?1")?
+        .query_row([tx_type], |row| row.get(0))
+        .optional()?;
+    Ok(count.unwrap_or(0))
+}
+
+/// One newest-first page of all transactions of one EIP-2718 type — a reverse
+/// scan of the `tx_types` primary key (`tx_type, block_number, tx_index`), so
+/// no sort step regardless of table size.
+pub fn tx_type_page(
+    conn: &Connection,
+    tx_type: u8,
+    limit: u64,
+    offset: u64,
+) -> rusqlite::Result<Vec<TxPointer>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT block_number, tx_index FROM tx_types WHERE tx_type = ?1 \
+         ORDER BY block_number DESC, tx_index DESC LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = stmt.query_map((tx_type, limit, offset), pointer_from_row)?;
+    rows.collect()
+}
+
+/// The execution block range recorded for one consensus output digest (the
+/// row key is [`digest_hex`] of it), or `None` when no block naming that
+/// digest has been indexed yet.
+pub fn consensus_range_by_digest(
+    conn: &Connection,
+    digest: &B256,
+) -> rusqlite::Result<Option<ConsensusRange>> {
+    conn.prepare_cached("SELECT first_block, last_block FROM consensus_blocks WHERE digest = ?1")?
+        .query_row([digest_hex(digest)], |row| {
+            Ok(ConsensusRange {
+                first_block: row.get(0)?,
+                last_block: row.get(1)?,
+            })
+        })
+        .optional()
+}
+
+/// [`consensus_range_by_digest`] for a whole list page (≤ `MAX_PER_PAGE`
+/// digests): one cached point lookup per digest, keyed back by the input
+/// digest. Digests without a row are simply absent from the map — the caller
+/// renders them as `exec_blocks: null`.
+pub fn consensus_ranges_by_digests(
+    conn: &Connection,
+    digests: &[B256],
+) -> rusqlite::Result<BTreeMap<B256, ConsensusRange>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT first_block, last_block FROM consensus_blocks WHERE digest = ?1")?;
+    let mut out = BTreeMap::new();
+    for digest in digests {
+        let range = stmt
+            .query_row([digest_hex(digest)], |row| {
+                Ok(ConsensusRange {
+                    first_block: row.get(0)?,
+                    last_block: row.get(1)?,
+                })
+            })
+            .optional()?;
+        if let Some(range) = range {
+            out.insert(*digest, range);
+        }
+    }
+    Ok(out)
+}
+
+/// Column list shared by the transfer page queries, in [`transfer_from_row`]
+/// order.
 const TRANSFER_COLUMNS: &str =
     "block_number, tx_index, log_index, token, from_addr, to_addr, value";
 
@@ -472,7 +697,7 @@ fn transfer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTransfer
     Ok(StoredTransfer {
         block_number: row.get(0)?,
         tx_index: row.get(1)?,
-        // column 2 (log_index) drives ordering only
+        log_index: row.get(2)?,
         token: row.get(3)?,
         from: row.get(4)?,
         to: row.get(5)?,
@@ -531,6 +756,41 @@ pub fn token_transfers_page(
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map((token, limit, offset), transfer_from_row)?;
+    rows.collect()
+}
+
+/// Count of ERC-20 transfers one transaction emitted (the `total` of
+/// `/txs/{hash}/transfers`) — a prefix probe of the `token_transfers` PK.
+pub fn count_transfers_for_tx(
+    conn: &Connection,
+    block_number: u64,
+    tx_index: u64,
+) -> rusqlite::Result<u64> {
+    conn.prepare_cached(
+        "SELECT COUNT(*) FROM token_transfers WHERE block_number = ?1 AND tx_index = ?2",
+    )?
+    .query_row((block_number, tx_index), |row| row.get(0))
+}
+
+/// One page of a transaction's ERC-20 transfers in emission order
+/// (`log_index ASC`) — a forward scan of the `token_transfers` PK prefix
+/// `(block_number, tx_index)`, so the order is free and rows from neighbouring
+/// transactions never enter the scan. Oldest-first here (unlike the feeds)
+/// because a transaction's internal transfers read top-to-bottom like a trace.
+pub fn transfers_for_tx_page(
+    conn: &Connection,
+    block_number: u64,
+    tx_index: u64,
+    limit: u64,
+    offset: u64,
+) -> rusqlite::Result<Vec<StoredTransfer>> {
+    let sql = format!(
+        "SELECT {TRANSFER_COLUMNS} FROM token_transfers \
+         WHERE block_number = ?1 AND tx_index = ?2 \
+         ORDER BY log_index ASC LIMIT ?3 OFFSET ?4"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map((block_number, tx_index, limit, offset), transfer_from_row)?;
     rows.collect()
 }
 
@@ -618,11 +878,22 @@ impl ReadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{AddressRow, TransferRow};
+    use crate::extract::{AddressRow, ConsensusRow, TransferRow, TxTypeRow};
     use tn_types::U256;
 
     fn addr(byte: u8) -> Address {
         Address::repeat_byte(byte)
+    }
+
+    fn digest(byte: u8) -> B256 {
+        B256::repeat_byte(byte)
+    }
+
+    fn ptr(block_number: u64, tx_index: u64) -> TxPointer {
+        TxPointer {
+            block_number,
+            tx_index,
+        }
     }
 
     fn temp_db() -> (tempfile::TempDir, PathBuf) {
@@ -631,20 +902,115 @@ mod tests {
         (dir, path)
     }
 
-    fn block_with_rows(number: u64, addresses: &[(Address, u64)]) -> ExtractedBlock {
+    /// A block with no derived rows at all; the other builders fill it in.
+    /// Every field is spelled out so adding one to `ExtractedBlock` fails here
+    /// until storage decides what to persist.
+    fn empty_block(number: u64) -> ExtractedBlock {
         ExtractedBlock {
             number,
-            address_rows: addresses
-                .iter()
-                .map(|(address, tx_index)| AddressRow {
-                    address: *address,
-                    block_number: number,
-                    tx_index: *tx_index,
-                })
-                .collect(),
+            address_rows: vec![],
             transfers: vec![],
             token_candidates: vec![],
+            tx_types: vec![],
+            consensus: None,
         }
+    }
+
+    /// Legacy (type 0) pointer rows only.
+    fn block_with_rows(number: u64, addresses: &[(Address, u64)]) -> ExtractedBlock {
+        let mut block = empty_block(number);
+        block.address_rows = addresses
+            .iter()
+            .map(|(address, tx_index)| AddressRow {
+                address: *address,
+                block_number: number,
+                tx_index: *tx_index,
+                tx_type: 0,
+            })
+            .collect();
+        block
+    }
+
+    /// One transaction per `(tx_index, tx_type, participant)`: the `tx_types`
+    /// row plus the participant's typed pointer row — what `extract_block`
+    /// emits for a single-party transaction.
+    fn block_with_typed_txs(number: u64, txs: &[(u64, u8, Address)]) -> ExtractedBlock {
+        let mut block = empty_block(number);
+        for (tx_index, tx_type, address) in txs {
+            block.tx_types.push(TxTypeRow {
+                tx_type: *tx_type,
+                block_number: number,
+                tx_index: *tx_index,
+            });
+            block.address_rows.push(AddressRow {
+                address: *address,
+                block_number: number,
+                tx_index: *tx_index,
+                tx_type: *tx_type,
+            });
+        }
+        block
+    }
+
+    /// Attach the consensus output (`parent_beacon_block_root` decode) the
+    /// block came from.
+    fn with_consensus(
+        mut block: ExtractedBlock,
+        digest: B256,
+        epoch: u32,
+        round: u32,
+    ) -> ExtractedBlock {
+        block.consensus = Some(ConsensusRow {
+            digest,
+            epoch,
+            round,
+            block_number: block.number,
+        });
+        block
+    }
+
+    /// Transfers `(token, from, to, value)` all in tx 0, log-indexed in order.
+    fn block_with_transfers(
+        number: u64,
+        transfers: &[(Address, Address, Address, u64)],
+    ) -> ExtractedBlock {
+        let mut block = empty_block(number);
+        block.transfers = transfers
+            .iter()
+            .enumerate()
+            .map(|(log_index, (token, from, to, value))| TransferRow {
+                block_number: number,
+                tx_index: 0,
+                log_index: log_index as u64,
+                token: *token,
+                from: *from,
+                to: *to,
+                value: U256::from(*value),
+            })
+            .collect();
+        block
+    }
+
+    /// Transfers at explicit `(tx_index, log_index, value)` positions (one
+    /// token, one sender/recipient pair) for the per-tx prefix scans.
+    fn block_with_positioned_transfers(
+        number: u64,
+        positions: &[(u64, u64, u64)],
+    ) -> ExtractedBlock {
+        let mut block = empty_block(number);
+        block.transfers = positions
+            .iter()
+            .map(|(tx_index, log_index, value)| TransferRow {
+                block_number: number,
+                tx_index: *tx_index,
+                log_index: *log_index,
+                token: addr(0xa1),
+                from: addr(0x0b),
+                to: addr(0x0c),
+                value: U256::from(*value),
+            })
+            .collect();
+        block
     }
 
     fn token_row(address: Address, ok: bool) -> TokenRow {
@@ -658,39 +1024,29 @@ mod tests {
         }
     }
 
-    fn counts(writer: &Writer) -> (u64, u64, Option<u64>) {
-        let conn = writer.conn.lock().expect("lock");
-        let address_rows: u64 = conn
-            .query_row("SELECT COUNT(*) FROM address_txs", [], |r| r.get(0))
-            .expect("count");
-        let transfers: u64 = conn
-            .query_row("SELECT COUNT(*) FROM token_transfers", [], |r| r.get(0))
-            .expect("count");
-        let cursor = read_cursor(&conn).expect("cursor");
-        (address_rows, transfers, cursor)
+    /// Row counts of every derived table plus the cursor — the "nothing moved"
+    /// witness for the cursor-guard and rollback tests. Extend it whenever a
+    /// table is added so those tests cover it for free.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Snapshot {
+        address_rows: u64,
+        transfers: u64,
+        tx_types: u64,
+        tx_type_count_sum: u64,
+        consensus_blocks: u64,
+        cursor: Option<u64>,
     }
 
-    fn block_with_transfers(
-        number: u64,
-        transfers: &[(Address, Address, Address, u64)],
-    ) -> ExtractedBlock {
-        ExtractedBlock {
-            number,
-            address_rows: vec![],
-            transfers: transfers
-                .iter()
-                .enumerate()
-                .map(|(log_index, (token, from, to, value))| TransferRow {
-                    block_number: number,
-                    tx_index: 0,
-                    log_index: log_index as u64,
-                    token: *token,
-                    from: *from,
-                    to: *to,
-                    value: U256::from(*value),
-                })
-                .collect(),
-            token_candidates: vec![],
+    fn snapshot(writer: &Writer) -> Snapshot {
+        let conn = writer.conn.lock().expect("lock");
+        let count = |sql: &str| -> u64 { conn.query_row(sql, [], |r| r.get(0)).expect("count") };
+        Snapshot {
+            address_rows: count("SELECT COUNT(*) FROM address_txs"),
+            transfers: count("SELECT COUNT(*) FROM token_transfers"),
+            tx_types: count("SELECT COUNT(*) FROM tx_types"),
+            tx_type_count_sum: count("SELECT COALESCE(SUM(count), 0) FROM tx_type_counts"),
+            consensus_blocks: count("SELECT COUNT(*) FROM consensus_blocks"),
+            cursor: read_cursor(&conn).expect("cursor"),
         }
     }
 
@@ -718,18 +1074,235 @@ mod tests {
         let key = addr_hex(&me);
         assert_eq!(count_address_transfers(&conn, &key).expect("count"), 3);
         let page = address_transfers_page(&conn, &key, 25, 0).expect("page");
-        // newest first across both union arms
+        // newest first across both union arms; log_index rides along
         assert_eq!(
             page.iter()
-                .map(|t| (t.block_number, t.value.as_str()))
+                .map(|t| (t.block_number, t.log_index, t.value.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(2, "7"), (1, "5"), (1, "10")]
+            vec![(2, 0, "7"), (1, 1, "5"), (1, 0, "10")]
         );
         // token feed sees every transfer
         let token_key = addr_hex(&token);
         assert_eq!(count_token_transfers(&conn, &token_key).expect("count"), 3);
         let token_page = token_transfers_page(&conn, &token_key, 2, 1).expect("page");
         assert_eq!(token_page.len(), 2); // offset pagination applies
+    }
+
+    #[tokio::test]
+    async fn transfers_for_tx_page_orders_by_log_index_within_one_tx() {
+        let (_dir, path) = temp_db();
+        let writer = Writer::open(path, 0x1e7).await.expect("open");
+        // block 5: tx 0 emits logs 3, 1, 7 (handed in out of order); tx 1 emits 0, 2
+        writer
+            .index_block(
+                block_with_positioned_transfers(
+                    5,
+                    &[(0, 3, 30), (1, 0, 100), (0, 1, 10), (1, 2, 120), (0, 7, 70)],
+                ),
+                vec![],
+            )
+            .await
+            .expect("index 5");
+        // block 6: tx 0 emits log 5 — same tx_index as (5, 0), different block
+        writer
+            .index_block(block_with_positioned_transfers(6, &[(0, 5, 50)]), vec![])
+            .await
+            .expect("index 6");
+
+        let conn = writer.conn.lock().expect("lock");
+        let logs = |block_number, tx_index| -> Vec<(u64, String)> {
+            transfers_for_tx_page(&conn, block_number, tx_index, 25, 0)
+                .expect("page")
+                .iter()
+                .map(|t| {
+                    assert_eq!((t.block_number, t.tx_index), (block_number, tx_index));
+                    (t.log_index, t.value.clone())
+                })
+                .collect()
+        };
+        let expected = |rows: &[(u64, &str)]| -> Vec<(u64, String)> {
+            rows.iter().map(|(i, v)| (*i, v.to_string())).collect()
+        };
+
+        // emission order, regardless of insert order
+        assert_eq!(count_transfers_for_tx(&conn, 5, 0).expect("count"), 3);
+        assert_eq!(logs(5, 0), expected(&[(1, "10"), (3, "30"), (7, "70")]));
+        // the PK prefix isolates neighbouring transactions and blocks
+        assert_eq!(count_transfers_for_tx(&conn, 5, 1).expect("count"), 2);
+        assert_eq!(logs(5, 1), expected(&[(0, "100"), (2, "120")]));
+        assert_eq!(count_transfers_for_tx(&conn, 6, 0).expect("count"), 1);
+        assert_eq!(logs(6, 0), expected(&[(5, "50")]));
+        assert_eq!(count_transfers_for_tx(&conn, 6, 1).expect("count"), 0);
+        assert!(logs(6, 1).is_empty());
+        // offset pagination
+        let second = transfers_for_tx_page(&conn, 5, 0, 1, 1).expect("page");
+        assert_eq!(
+            second.iter().map(|t| t.log_index).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_blocks_merge_exec_range_per_digest() {
+        let (_dir, path) = temp_db();
+        let writer = Writer::open(path, 0x1e7).await.expect("open");
+        let (output_a, output_b) = (digest(0xd1), digest(0xd2));
+        // one output -> three exec blocks (one per batch): the range widens
+        for number in 10..=12 {
+            writer
+                .index_block(with_consensus(empty_block(number), output_a, 3, 41), vec![])
+                .await
+                .expect("index");
+        }
+        // the next output gets its own row
+        writer
+            .index_block(with_consensus(empty_block(13), output_b, 3, 42), vec![])
+            .await
+            .expect("index 13");
+        // a block naming no output (genesis shape): no row anywhere
+        writer
+            .index_block(empty_block(14), vec![])
+            .await
+            .expect("index 14");
+        assert_eq!(snapshot(&writer).consensus_blocks, 2);
+
+        let conn = writer.conn.lock().expect("lock");
+        let key_a = digest_hex(&output_a);
+        // 0x + 64 lowercase hex chars
+        assert_eq!(key_a, format!("0x{}", "d1".repeat(32)));
+        assert_eq!(
+            consensus_range_by_digest(&conn, &output_a).expect("read"),
+            Some(ConsensusRange {
+                first_block: 10,
+                last_block: 12
+            })
+        );
+        assert_eq!(
+            consensus_range_by_digest(&conn, &output_b).expect("read"),
+            Some(ConsensusRange {
+                first_block: 13,
+                last_block: 13
+            })
+        );
+        assert_eq!(
+            consensus_range_by_digest(&conn, &digest(0xd3)).expect("read"),
+            None
+        );
+        // epoch/round persist alongside the range
+        let (epoch, round): (u32, u32) = conn
+            .query_row(
+                "SELECT epoch, round FROM consensus_blocks WHERE digest = ?1",
+                [&key_a],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!((epoch, round), (3, 41));
+
+        // batch lookup keeps only the digests that have rows, keyed by digest
+        let ranges =
+            consensus_ranges_by_digests(&conn, &[output_a, digest(0xd3), output_b]).expect("batch");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[&output_a].last_block, 12);
+        assert_eq!(ranges[&output_b].first_block, 13);
+    }
+
+    #[tokio::test]
+    async fn tx_type_pages_newest_first_and_counts_exact() {
+        let (_dir, path) = temp_db();
+        let writer = Writer::open(path, 0x1e7).await.expect("open");
+        let me = addr(0x0a);
+        // block 1: legacy, eip1559, legacy; block 2: eip1559, eip2930
+        writer
+            .index_block(
+                block_with_typed_txs(1, &[(0, 0, me), (1, 2, me), (2, 0, me)]),
+                vec![],
+            )
+            .await
+            .expect("index 1");
+        writer
+            .index_block(block_with_typed_txs(2, &[(0, 2, me), (1, 1, me)]), vec![])
+            .await
+            .expect("index 2");
+
+        let snap = snapshot(&writer);
+        assert_eq!(snap.tx_types, 5);
+        assert_eq!(
+            snap.tx_type_count_sum, snap.tx_types,
+            "counters must equal the rows they count"
+        );
+
+        let conn = writer.conn.lock().expect("lock");
+        assert_eq!(count_tx_type(&conn, 0).expect("count"), 2);
+        assert_eq!(count_tx_type(&conn, 1).expect("count"), 1);
+        assert_eq!(count_tx_type(&conn, 2).expect("count"), 2);
+        assert_eq!(
+            count_tx_type(&conn, 3).expect("count"),
+            0,
+            "unseen type is 0"
+        );
+        assert_eq!(
+            tx_type_page(&conn, 0, 25, 0).expect("page"),
+            vec![ptr(1, 2), ptr(1, 0)]
+        );
+        assert_eq!(
+            tx_type_page(&conn, 2, 25, 0).expect("page"),
+            vec![ptr(2, 0), ptr(1, 1)]
+        );
+        assert_eq!(
+            tx_type_page(&conn, 2, 1, 1).expect("page"),
+            vec![ptr(1, 1)],
+            "offset applies"
+        );
+        assert!(tx_type_page(&conn, 4, 25, 0).expect("page").is_empty());
+    }
+
+    #[tokio::test]
+    async fn address_txs_page_by_type_filters_one_type() {
+        let (_dir, path) = temp_db();
+        let writer = Writer::open(path, 0x1e7).await.expect("open");
+        let (me, other) = (addr(0x0a), addr(0x0b));
+        writer
+            .index_block(
+                block_with_typed_txs(1, &[(0, 0, me), (1, 2, me), (2, 2, other)]),
+                vec![],
+            )
+            .await
+            .expect("index 1");
+        writer
+            .index_block(
+                block_with_typed_txs(3, &[(0, 2, me), (1, 0, other)]),
+                vec![],
+            )
+            .await
+            .expect("index 3");
+
+        let conn = writer.conn.lock().expect("lock");
+        let key = addr_hex(&me);
+        // the untyped page is unchanged by the filter column
+        assert_eq!(count_address_txs(&conn, &key).expect("count"), 3);
+        assert_eq!(
+            address_txs_page(&conn, &key, 25, 0).expect("page"),
+            vec![ptr(3, 0), ptr(1, 1), ptr(1, 0)]
+        );
+        // typed: newest first within one type, other addresses never leak in
+        assert_eq!(count_address_txs_by_type(&conn, &key, 2).expect("count"), 2);
+        assert_eq!(
+            address_txs_page_by_type(&conn, &key, 2, 25, 0).expect("page"),
+            vec![ptr(3, 0), ptr(1, 1)]
+        );
+        assert_eq!(count_address_txs_by_type(&conn, &key, 0).expect("count"), 1);
+        assert_eq!(
+            address_txs_page_by_type(&conn, &key, 0, 25, 0).expect("page"),
+            vec![ptr(1, 0)]
+        );
+        assert_eq!(count_address_txs_by_type(&conn, &key, 4).expect("count"), 0);
+        assert!(address_txs_page_by_type(&conn, &key, 4, 25, 0)
+            .expect("page")
+            .is_empty());
+        assert_eq!(
+            count_address_txs_by_type(&conn, &addr_hex(&other), 2).expect("count"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -740,9 +1313,9 @@ mod tests {
         // extraction emits BOTH rows for a self-send; the PK dedups at write time
         let block = block_with_rows(1, &[(me, 0), (me, 0)]);
         assert!(writer.index_block(block, vec![]).await.expect("index"));
-        let (address_rows, _, cursor) = counts(&writer);
-        assert_eq!(address_rows, 1);
-        assert_eq!(cursor, Some(1));
+        let snap = snapshot(&writer);
+        assert_eq!(snap.address_rows, 1);
+        assert_eq!(snap.cursor, Some(1));
     }
 
     #[tokio::test]
@@ -768,27 +1341,7 @@ mod tests {
 
         let conn = writer.conn.lock().expect("lock");
         let page = address_txs_page(&conn, &addr_hex(&me), 25, 0).expect("page");
-        assert_eq!(
-            page,
-            vec![
-                TxPointer {
-                    block_number: 5,
-                    tx_index: 1
-                },
-                TxPointer {
-                    block_number: 3,
-                    tx_index: 0
-                },
-                TxPointer {
-                    block_number: 1,
-                    tx_index: 2
-                },
-                TxPointer {
-                    block_number: 1,
-                    tx_index: 0
-                },
-            ]
-        );
+        assert_eq!(page, vec![ptr(5, 1), ptr(3, 0), ptr(1, 2), ptr(1, 0)]);
         assert_eq!(count_address_txs(&conn, &addr_hex(&me)).expect("count"), 4);
     }
 
@@ -915,33 +1468,48 @@ mod tests {
         let (_dir, path) = temp_db();
         let writer = Writer::open(path, 0x1e7).await.expect("open");
         let me = addr(0x0a);
+        let output = digest(0xd1);
 
         assert!(writer
-            .index_block(block_with_rows(5, &[(me, 0)]), vec![])
+            .index_block(
+                with_consensus(block_with_typed_txs(5, &[(0, 0, me)]), output, 1, 1),
+                vec![]
+            )
             .await
             .expect("index 5"));
-        let before = counts(&writer);
+        let before = snapshot(&writer);
 
-        // same block twice: skipped, counts unchanged
+        // same block twice: skipped, every table unchanged
         assert!(!writer
-            .index_block(block_with_rows(5, &[(me, 0), (addr(0x0b), 1)]), vec![])
+            .index_block(
+                with_consensus(
+                    block_with_typed_txs(5, &[(0, 0, me), (1, 2, addr(0x0b))]),
+                    output,
+                    1,
+                    1
+                ),
+                vec![]
+            )
             .await
             .expect("re-index 5"));
-        assert_eq!(counts(&writer), before);
+        assert_eq!(snapshot(&writer), before);
 
         // older block: skipped
         assert!(!writer
-            .index_block(block_with_rows(4, &[(addr(0x0c), 0)]), vec![])
+            .index_block(
+                with_consensus(block_with_typed_txs(4, &[(0, 2, addr(0x0c))]), output, 1, 1),
+                vec![]
+            )
             .await
             .expect("index 4"));
-        assert_eq!(counts(&writer), before);
+        assert_eq!(snapshot(&writer), before);
 
         // newer block advances
         assert!(writer
             .index_block(block_with_rows(6, &[(me, 0)]), vec![])
             .await
             .expect("index 6"));
-        assert_eq!(counts(&writer).2, Some(6));
+        assert_eq!(snapshot(&writer).cursor, Some(6));
     }
 
     #[tokio::test]
@@ -949,21 +1517,28 @@ mod tests {
         let (_dir, path) = temp_db();
         let writer = Writer::open(path, 0x1e7).await.expect("open");
         let me = addr(0x0a);
+        let output = digest(0xd1);
         assert!(writer
-            .index_block(block_with_rows(1, &[(me, 0)]), vec![])
+            .index_block(
+                with_consensus(block_with_typed_txs(1, &[(0, 0, me)]), output, 1, 1),
+                vec![]
+            )
             .await
             .expect("index 1"));
-        let before = counts(&writer);
+        let before = snapshot(&writer);
+        assert_eq!((before.tx_types, before.consensus_blocks), (1, 1));
 
-        // Run the full statement sequence for block 2 — rows, transfers, and the
-        // cursor advance — then fail before COMMIT. The drop rolls back, exactly
-        // what any mid-transaction error produces.
+        // Run the full statement sequence for block 2 — typed pointers, type
+        // rows + counters, the consensus range upsert, transfers, tokens, and
+        // the cursor advance — then fail before COMMIT. The drop rolls back,
+        // exactly what any mid-transaction error produces.
         {
             let mut conn = writer.conn.lock().expect("lock");
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .expect("begin");
-            let mut block = block_with_rows(2, &[(addr(0x0b), 0)]);
+            let mut block =
+                with_consensus(block_with_typed_txs(2, &[(0, 2, addr(0x0b))]), output, 1, 1);
             block.transfers.push(TransferRow {
                 block_number: 2,
                 tx_index: 0,
@@ -980,14 +1555,24 @@ mod tests {
         }
 
         assert_eq!(
-            counts(&writer),
+            snapshot(&writer),
             before,
-            "rollback must leave rows AND cursor untouched"
+            "rollback must leave every table AND the cursor untouched"
         );
         let conn = writer.conn.lock().expect("lock");
         assert!(super::token_row(&conn, &addr_hex(&addr(0xa1)))
             .expect("row")
             .is_none());
+        // in-place updates roll back too: the range did not widen and the new
+        // type's counter was never created
+        assert_eq!(
+            consensus_range_by_digest(&conn, &output).expect("read"),
+            Some(ConsensusRange {
+                first_block: 1,
+                last_block: 1
+            })
+        );
+        assert_eq!(count_tx_type(&conn, 2).expect("count"), 0);
     }
 
     #[tokio::test]
@@ -1009,7 +1594,83 @@ mod tests {
         // reopen: version mismatch drops everything -> fresh cursor, empty tables
         let writer = Writer::open(path, 0x1e7).await.expect("reopen");
         assert_eq!(writer.last_indexed().await.expect("cursor"), None);
-        assert_eq!(counts(&writer).0, 0);
+        assert_eq!(snapshot(&writer).address_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn schema_v2_file_is_rebuilt_as_v3() {
+        let (_dir, path) = temp_db();
+        {
+            let writer = Writer::open(path.clone(), 0x1e7).await.expect("open");
+            let conn = writer.conn.lock().expect("lock");
+            // Turn the fresh file into a v2 one: the v2 `address_txs` shape (no
+            // tx_type), none of the v3 tables, a cursor, and version '2'.
+            conn.execute_batch(
+                "DROP TABLE address_txs;
+                 DROP TABLE tx_types;
+                 DROP TABLE tx_type_counts;
+                 DROP TABLE consensus_blocks;
+                 CREATE TABLE address_txs (
+                     address      TEXT    NOT NULL,
+                     block_number INTEGER NOT NULL,
+                     tx_index     INTEGER NOT NULL,
+                     PRIMARY KEY (address, block_number, tx_index)
+                 ) WITHOUT ROWID;
+                 INSERT INTO address_txs VALUES ('0x0a', 9, 0);
+                 UPDATE meta SET value = '2' WHERE key = 'schema_version';
+                 INSERT OR REPLACE INTO meta (key, value) VALUES ('last_indexed', '9');",
+            )
+            .expect("downgrade to v2");
+        }
+
+        let writer = Writer::open(path, 0x1e7).await.expect("reopen");
+        // cursor reset -> replay from 0; the v2 rows are gone
+        assert_eq!(writer.last_indexed().await.expect("cursor"), None);
+        assert_eq!(snapshot(&writer).address_rows, 0);
+        {
+            let conn = writer.conn.lock().expect("lock");
+            assert_eq!(
+                read_meta(&conn, "schema_version").expect("meta").as_deref(),
+                Some("3")
+            );
+            // v3 shape: address_txs carries tx_type and the new tables exist
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(address_txs)")
+                .expect("pragma");
+            let columns: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("columns");
+            assert!(
+                columns.iter().any(|c| c == "tx_type"),
+                "address_txs columns: {columns:?}"
+            );
+            for table in ["tx_types", "tx_type_counts", "consensus_blocks"] {
+                assert!(
+                    table_exists(&conn, table).expect("exists"),
+                    "{table} must exist after the rebuild"
+                );
+            }
+        }
+        // and the rebuilt file indexes typed rows normally
+        assert!(writer
+            .index_block(
+                with_consensus(
+                    block_with_typed_txs(1, &[(0, 2, addr(0x0a))]),
+                    digest(0xd1),
+                    0,
+                    1
+                ),
+                vec![]
+            )
+            .await
+            .expect("index"));
+        let snap = snapshot(&writer);
+        assert_eq!(
+            (snap.address_rows, snap.tx_types, snap.consensus_blocks),
+            (1, 1, 1)
+        );
     }
 
     #[tokio::test]

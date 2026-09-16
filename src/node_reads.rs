@@ -10,7 +10,27 @@
 //!
 //! `ConsensusChain`/`EpochRecordDb` reads are async message-passing to a
 //! background file-owner thread — they are awaited directly on the async
-//! runtime and need no permit.
+//! runtime and need no permit. That single actor thread serializes them, so a
+//! `/consensus/blocks` page of `per_page` header reads is `per_page` sequential
+//! round-trips, bounded per request only by `per_page <= 100`.
+//!
+//! Consensus numbers are guarded to `1..=latest_consensus_number()` BEFORE the
+//! pack is touched: number 0 is the pre-genesis anchor (never stored) and a
+//! current-epoch miss surfaces as `Err`, not `None`. The in-memory latest
+//! counter is updated only after the pack write is acknowledged (TN
+//! `crates/storage/src/consensus.rs`: `save_consensus_output(..).await?` and
+//! only then `latest_consensus.update(..)`), so any number `<= latest` is
+//! readable by construction and a current-epoch `Err` is a real read failure,
+//! never a tip race. For a SEALED epoch, TN's by-number reads answer an absent
+//! pack and a pack that cannot be opened (truncated, corrupt) identically with
+//! `Ok(None)`; only the by-digest read preserves the error. So a by-number
+//! miss below the tip is "absent locally or unreadable" — a normal observer
+//! state rendered as 404 / `null`, with the node log and the by-digest
+//! `/blocks/{n}` path as the diagnostics. Per-epoch pack helpers likewise
+//! degrade to `None` + `warn!` when the pack is not held locally. The one
+//! CPU-bound consensus operation, BLS certificate verification, runs under the
+//! blocking permit like a `RethEnv` read — see
+//! [`NodeReader::verify_epoch_certificate`].
 //!
 //! Per-epoch committee reads must name their pin: tn-reth has no unpinned
 //! per-epoch committee reader, because the registry mutates the CURRENT
@@ -23,18 +43,23 @@ use crate::{
     storage::TxPointer,
 };
 use eyre::eyre;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tn_reth::{
     error::EvmReadError,
     system_calls::{ConsensusRegistry, EpochState},
     RethEnv,
 };
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
-    Address, Block, BlockHeader as _, Bytes, Receipt, RecoveredBlock, SealedBlock, SolValue,
-    TransactionSigned, TxHash, B256,
+    Address, AuthorityIdentifier, Block, BlockHeader as _, BlsPublicKey, Bytes, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusOutput, EpochCertificate, EpochRecord, Receipt, RecoveredBlock,
+    ReputationScores, Round, SealedBlock, SealedHeader, SolValue, TransactionSigned, TxHash, B256,
 };
 use tokio::sync::{oneshot, Semaphore};
+use tracing::warn;
 
 /// Maximum number of concurrent blocking node reads.
 ///
@@ -563,6 +588,265 @@ impl NodeReader {
         })
         .await
     }
+
+    // ----- consensus chain: async actor reads, no permit -----
+
+    /// The newest consensus output number the node has processed. Sync: an
+    /// in-memory atomic, no actor round-trip. It advances only after the
+    /// output's pack write is acknowledged, so every number in `1..=this` is
+    /// readable by construction (the pack tail can be one output AHEAD of it
+    /// while a write is in flight, never behind).
+    pub fn latest_consensus_number(&self) -> u64 {
+        self.consensus.latest_consensus_number()
+    }
+
+    /// The epoch of the newest processed consensus output (sync, in-memory).
+    pub fn latest_consensus_epoch(&self) -> u32 {
+        self.consensus.latest_consensus_epoch()
+    }
+
+    /// One FULL consensus output by number — header plus every batch's raw
+    /// transactions (serves `/consensus/blocks/{n}` detail and `/batches`).
+    /// One actor round-trip decoding roughly a `/blocks` page of tx bytes;
+    /// never call it from a list.
+    ///
+    /// `Ok(None)` outside `1..=latest_consensus_number()` with no pack touch
+    /// (see [`consensus_number_stored`]) and for a sealed epoch whose pack this
+    /// observer does not hold OR cannot open (absent, truncated and corrupt
+    /// all collapse to `Ok(None)` in TN's `consensus_output_by_number`, so a
+    /// 404 alone does not prove the pack is absent: check the node log and
+    /// `/blocks/{n}.consensus.consensus_number`, which resolves by digest and
+    /// surfaces the real error as a `warn!`). `Err` for a current-epoch read
+    /// failure or a sealed pack that opens but cannot be read — always a real
+    /// fault, because the latest counter advances only after the pack write
+    /// is acknowledged (there is no tip race to tolerate).
+    pub async fn consensus_output(&self, number: u64) -> eyre::Result<Option<ConsensusOutput>> {
+        if !consensus_number_stored(number, self.latest_consensus_number()) {
+            return Ok(None);
+        }
+        self.consensus
+            .consensus_output_by_number(number)
+            .await
+            .map_err(chain_err)
+    }
+
+    /// The newest consensus header (serves `/consensus/latest`): one actor
+    /// round-trip for the header numbered `latest_consensus_number()`, NOT
+    /// the pack's own tail — the tail can be one output ahead of the counter
+    /// while a write is in flight, and reading by the counter keeps `number`
+    /// consistent with the bounds guard on `/consensus/blocks/{n}` and with
+    /// `/consensus/blocks.total`. `Ok(None)` before the first output.
+    pub async fn consensus_latest_header(&self) -> eyre::Result<Option<ConsensusHeader>> {
+        let latest = self.latest_consensus_number();
+        if latest == 0 {
+            return Ok(None);
+        }
+        self.consensus
+            .consensus_header_by_number(latest)
+            .await
+            .map_err(chain_err)
+    }
+
+    /// One newest-first page of consensus headers (serves `/consensus/blocks`).
+    /// Returns `(headers, total)` with `total = latest_consensus_number()`.
+    ///
+    /// Numbers come from [`consensus_page_numbers`]; each is one sequential
+    /// actor round-trip (the actor serializes them regardless), so a page
+    /// costs `per_page` header decodes. Rows this observer lacks (`Ok(None)`:
+    /// a sealed epoch's pack absent locally or unreadable — TN's by-number
+    /// read does not distinguish the two) are SKIPPED with one summarizing
+    /// `warn!` — the page shrinks rather than failing, and `total` still
+    /// reports the chain's count. An `Err` fails the page.
+    pub async fn consensus_headers_page(
+        &self,
+        page: u64,
+        per_page: u64,
+    ) -> eyre::Result<(Vec<ConsensusHeader>, u64)> {
+        let total = self.latest_consensus_number();
+        let numbers = consensus_page_numbers(total, page, per_page);
+        let mut headers = Vec::with_capacity(numbers.len());
+        let mut skipped: Vec<u64> = Vec::new();
+        for number in numbers {
+            match self
+                .consensus
+                .consensus_header_by_number(number)
+                .await
+                .map_err(chain_err)?
+            {
+                Some(header) => headers.push(header),
+                None => skipped.push(number),
+            }
+        }
+        if let (Some(newest), Some(oldest)) = (skipped.first(), skipped.last()) {
+            warn!(
+                count = skipped.len(),
+                newest, oldest, "consensus headers absent locally or unreadable; page shrunk"
+            );
+        }
+        Ok((headers, total))
+    }
+
+    /// The consensus output number whose header hashes to `digest`, looked up
+    /// in `epoch`'s pack (serves `consensus.consensus_number` on
+    /// `/blocks/{n}`): one actor round-trip that decodes the header to read
+    /// its number. `Ok(None)` for an epoch past the tip (no pack touch), for a
+    /// pack this observer does not hold, or an unknown digest.
+    pub async fn consensus_number_by_digest(
+        &self,
+        epoch: u32,
+        digest: B256,
+    ) -> eyre::Result<Option<u64>> {
+        if epoch > self.latest_consensus_epoch() {
+            return Ok(None);
+        }
+        Ok(self
+            .consensus
+            .consensus_header_by_digest(epoch, ConsensusHeaderDigest::from(digest))
+            .await
+            .map_err(chain_err)?
+            .map(|header| header.number))
+    }
+
+    // ----- epoch records: async actor reads, no permit -----
+
+    /// An epoch's record + certificate and its predecessor's record, as
+    /// `(this, previous)` (serves `/consensus/epochs` rows and `/epochs/{n}`).
+    ///
+    /// `this` is `get_epoch_by_number` — record and certificate read
+    /// atomically; the certificate is aggregated at the NEXT epoch's start, so
+    /// the newest sealed epoch is normally `Some((record, None))`, and the
+    /// in-progress epoch has no record yet (`None`). `previous` is
+    /// `record_by_epoch(epoch - 1)` (`None` for epoch 0) and yields the epoch's
+    /// first numbers: `previous.final_consensus.number + 1` and
+    /// `previous.final_state.number + 1`. Two to three actor round-trips.
+    pub async fn epoch_record_pair(
+        &self,
+        epoch: u32,
+    ) -> (
+        Option<(EpochRecord, Option<EpochCertificate>)>,
+        Option<EpochRecord>,
+    ) {
+        let db = self.consensus.epochs();
+        let this = db.get_epoch_by_number(epoch).await;
+        let previous = match epoch.checked_sub(1) {
+            Some(prev) => db.record_by_epoch(prev).await,
+            None => None,
+        };
+        (this, previous)
+    }
+
+    /// Whether this observer holds `record`'s epoch pack through its final
+    /// output (serves `pack_complete` on `/consensus/epochs/{n}`): one header
+    /// read of `record.final_consensus.number`. `false` when the pack is
+    /// absent, truncated or corrupt as well as when it is genuinely
+    /// incomplete — TN's `is_epoch_complete` collapses an `Ok(None)` and a
+    /// read error (logged at `error!`) alike.
+    pub async fn epoch_pack_complete(&self, record: &EpochRecord) -> bool {
+        self.consensus.is_epoch_complete(record).await
+    }
+
+    /// Each authority's last committed round in `epoch`'s pack (serves
+    /// `last_committed_rounds` on `/consensus/epochs/{n}`), sorted by round
+    /// DESCENDING then authority ascending — "furthest ahead" first, and
+    /// deterministic for equal rounds. One actor round-trip.
+    ///
+    /// `None` past the tip epoch (no pack touch) and, with a `warn!`, when the
+    /// pack is not held locally or cannot be read — a normal observer state the
+    /// route renders as `null`.
+    pub async fn epoch_last_committed(
+        &self,
+        epoch: u32,
+    ) -> Option<Vec<(AuthorityIdentifier, Round)>> {
+        if epoch > self.latest_consensus_epoch() {
+            return None;
+        }
+        match self.consensus.read_last_committed(epoch).await {
+            Ok(map) => {
+                let mut rounds: Vec<(AuthorityIdentifier, Round)> = map.into_iter().collect();
+                rounds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                Some(rounds)
+            }
+            Err(e) => {
+                warn!(epoch, error = %e, "last committed rounds unavailable");
+                None
+            }
+        }
+    }
+
+    /// The final reputation scores of `epoch` (serves `final_reputation_scores`
+    /// on `/consensus/epochs/{n}`): the pack's last commit flagged
+    /// `final_of_schedule`, decoded as one sub-DAG in one actor round-trip.
+    /// `None` past the tip epoch, when the pack lacks such a commit or is not
+    /// held locally, and (with a `warn!`) on a read error.
+    pub async fn epoch_final_reputation(&self, epoch: u32) -> Option<ReputationScores> {
+        if epoch > self.latest_consensus_epoch() {
+            return None;
+        }
+        match self
+            .consensus
+            .read_latest_commit_with_final_reputation_scores(epoch)
+            .await
+        {
+            Ok(sub_dag) => sub_dag.map(|dag| dag.reputation_scores().clone()),
+            Err(e) => {
+                warn!(epoch, error = %e, "final reputation scores unavailable");
+                None
+            }
+        }
+    }
+
+    /// The BLS keys seated for `epoch` (leader/author → BLS on detail routes):
+    /// `record(epoch).committee`, else `record(epoch - 1).next_committee` (the
+    /// in-progress epoch), else `None`. One to two actor round-trips.
+    pub async fn committee_keys(&self, epoch: u32) -> Option<BTreeSet<BlsPublicKey>> {
+        self.consensus.epochs().get_committee_keys(epoch).await
+    }
+
+    /// Verify `cert` against `record` (`verified` on `/epochs/{n}` and
+    /// `/consensus/epochs/{n}`): a digest match plus an aggregate BLS
+    /// signature check over the bitmap's signers. That pairing is CPU work, so
+    /// it runs on the blocking pool under a permit exactly like a `RethEnv`
+    /// read — never inline on the async runtime. Detail routes only.
+    pub async fn verify_epoch_certificate(
+        &self,
+        record: EpochRecord,
+        cert: EpochCertificate,
+    ) -> eyre::Result<bool> {
+        self.read("indexer-verify-epoch-cert", move |_env| {
+            Ok(record.verify_with_cert(&cert))
+        })
+        .await
+    }
+
+    /// The canonical tip's sealed header (serves `exec_tip` /
+    /// `exec_tip_consensus` on `/consensus/latest`), via the blocking permit
+    /// path. `canonical_tip` reads the canonical-in-memory state, so it can
+    /// LEAD `last_block_number()` — the committed-DB view the other reads use —
+    /// by an in-flight output.
+    pub async fn tip_header(&self) -> eyre::Result<SealedHeader> {
+        self.read("indexer-tip-header", |env| Ok(env.canonical_tip()))
+            .await
+    }
+}
+
+/// Lift a `ConsensusChain` read failure into `eyre`.
+///
+/// `ConsensusChainError` implements `std::error::Error`, and every payload it
+/// carries (`PackError`, `EpochDbError`, their `Arc<io::Error>` /
+/// `Arc<OpenError>` members) is `Send + Sync + 'static`, so the typed error is
+/// preserved for downcasting instead of being flattened to its message.
+fn chain_err(e: ConsensusChainError) -> eyre::Report {
+    eyre::Report::new(e)
+}
+
+/// Whether `number` can name a stored consensus output given the tip
+/// `latest`: outputs are numbered densely `1..=latest`. Number 0 is the
+/// pre-genesis anchor (never written to a pack) and anything past the tip is
+/// not there yet — both are answered WITHOUT a pack read, because a
+/// current-epoch miss surfaces as `Err`, not `None`
+/// (TN `crates/storage/src/consensus.rs:842-865`).
+pub fn consensus_number_stored(number: u64, latest: u64) -> bool {
+    number != 0 && number <= latest
 }
 
 /// Fetch and decode the three ERC-20 metadata fields against one `RethEnv`.
@@ -687,6 +971,18 @@ pub fn desc_page_items(total: u64, page: u64, per_page: u64) -> Vec<u64> {
     }
 }
 
+/// The consensus output numbers of descending page `page`, newest first.
+/// Outputs are numbered densely `1..=total` (`total = latest_consensus_number()`;
+/// 0 is the pre-genesis anchor, never stored), so this is [`desc_page_items`]'
+/// 0-based indices shifted up by one: `total 5, per_page 2` gives page 0
+/// `[5, 4]`, page 1 `[3, 2]`, page 2 `[1]`, page 3 `[]`.
+pub fn consensus_page_numbers(total: u64, page: u64, per_page: u64) -> Vec<u64> {
+    desc_page_items(total, page, per_page)
+        .into_iter()
+        .map(|index| index + 1)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +1064,31 @@ mod tests {
             desc_page_items(50, 1, 25),
             (0..=24).rev().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn consensus_page_numbers_are_one_based_newest_first() {
+        assert_eq!(consensus_page_numbers(5, 0, 2), vec![5, 4]);
+        assert_eq!(consensus_page_numbers(5, 1, 2), vec![3, 2]);
+        assert_eq!(consensus_page_numbers(5, 2, 2), vec![1]);
+        assert_eq!(consensus_page_numbers(5, 3, 2), Vec::<u64>::new());
+        // no outputs yet: nothing to page
+        assert_eq!(consensus_page_numbers(0, 0, 25), Vec::<u64>::new());
+        // number 0 (the pre-genesis anchor) is never yielded
+        assert_eq!(consensus_page_numbers(1, 0, 25), vec![1]);
+        // the first page always starts at `total`
+        assert_eq!(consensus_page_numbers(100, 0, 25)[0], 100);
+        assert_eq!(consensus_page_numbers(100, 0, 25).len(), 25);
+    }
+
+    #[test]
+    fn consensus_number_bounds_exclude_anchor_and_future() {
+        assert!(!consensus_number_stored(0, 10));
+        assert!(consensus_number_stored(1, 10));
+        assert!(consensus_number_stored(10, 10));
+        assert!(!consensus_number_stored(11, 10));
+        // nothing processed yet: nothing stored
+        assert!(!consensus_number_stored(1, 0));
     }
 
     #[test]
