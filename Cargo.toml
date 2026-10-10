@@ -85,3 +85,10 @@ panic = "unwind" # NEVER "abort": ExEx isolation (catch_unwind) and node task
 # tn-storage = { path = "../tn-3/crates/storage" }
 # tn-engine = { path = "../tn-3/crates/engine" }
 # tn-executor = { path = "../tn-3/crates/consensus/executor" }
+
+# libp2p patches, mirrored from telcoin-network's own workspace. Cargo ignores
+# [patch] sections in dependencies, so each release must repeat them here.
+# Keep these tags in sync with the tn-* tags above.
+[patch.crates-io]
+libp2p-quic = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
+libp2p-connection-limits = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
