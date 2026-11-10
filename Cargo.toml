@@ -12,16 +12,16 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # ALL tn deps MUST pin the exact same rev; bump all in ONE commit. Mixed revs give
 # cargo two checkouts of the same crates => duplicate-type errors everywhere.
-# <TN_REV> = the exex-startup branch head (BLS passphrase API + RethEnv read API).
-# ExEx (da90408a) is in NO tag yet; switch rev -> tag when a tag containing all of it exists.
-telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
-tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
-tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
-tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
-tn-reth = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }     # RethEnv is named in ExEx signatures; NOT re-exported by tn-exex
-tn-storage = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }  # ConsensusChain lives here (named in node_reads/axum state)
-tn-engine = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }   # only to forward adiri
-tn-executor = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" } # only to forward adiri
+# Pinned to the release tag the adiri fleet runs. Every tag from v0.16.0-adiri on contains
+# the ExEx host (da90408a), the BLS passphrase API and the RethEnv read API.
+telcoin-network-cli = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+tn-node = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+tn-exex = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+tn-types = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+tn-reth = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }     # RethEnv is named in ExEx signatures; NOT re-exported by tn-exex
+tn-storage = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }  # ConsensusChain lives here (named in node_reads/axum state)
+tn-engine = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }   # only to forward adiri
+tn-executor = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" } # only to forward adiri
 
 [dependencies]
 telcoin-network-cli = { workspace = true }
@@ -56,10 +56,13 @@ tempfile = "3"
 [features]
 default = []
 # Testnet chain-id-2017 builds ONLY; NOT for local dev (chain 0x1e7) or mainnet.
-# The adiri feature does NOT cascade in tn-3 — every declaring crate must be
-# enabled explicitly. Re-verify this set on every rev bump (see the ops runbook).
+# Every direct tn dependency that declares `adiri` is enabled here, mirroring the
+# telcoin-network binary's own `adiri` feature. tn-node/adiri forwards it to the
+# node crates this package cannot name (tn-config, tn-network-libp2p and, through it,
+# tn-node-record). Re-verify this set on every rev bump (see the ops runbook).
 adiri = [
   "telcoin-network-cli/adiri",
+  "tn-node/adiri",
   "tn-types/adiri",
   "tn-reth/adiri",
   "tn-storage/adiri",
@@ -86,9 +89,15 @@ panic = "unwind" # NEVER "abort": ExEx isolation (catch_unwind) and node task
 # tn-engine = { path = "../tn-3/crates/engine" }
 # tn-executor = { path = "../tn-3/crates/consensus/executor" }
 
-# libp2p patches, mirrored from telcoin-network's own workspace. Cargo ignores
-# [patch] sections in dependencies, so each release must repeat them here.
-# Keep these tags in sync with the tn-* tags above.
+# Crate patches, mirrored from telcoin-network's own [patch.crates-io]. Cargo ignores
+# [patch] sections in dependencies, so each release must repeat ALL of them here.
+# quinn-proto and libp2p-quic are needed to compile (tn-network-libp2p uses the
+# patched IncomingStats API). The others only change behaviour, so dropping one
+# still builds but silently loses its fix (libp2p-gossipsub: IWANT expiry and the
+# lazy-negotiation rejection). Keep these tags in sync with the tn-* tags above.
 [patch.crates-io]
-libp2p-quic = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
-libp2p-connection-limits = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.16.0-adiri" }
+quinn-proto = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+libp2p-quic = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+libp2p-connection-limits = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+libp2p-gossipsub = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
+revm-inspectors = { git = "https://github.com/Telcoin-Association/telcoin-network", tag = "v0.17.0-adiri" }
